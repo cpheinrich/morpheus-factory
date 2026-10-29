@@ -106,3 +106,23 @@ describe("CapacityBroker", () => {
     expect(envSuffix("__codex--pro__")).toBe("CODEX_PRO");
   });
 });
+
+describe("CapacityBroker — gateway origin and range", () => {
+  it("rejects a percentage above 100 at parse time", () => {
+    const broken = { ...capacity, groups: { claude: { ...capacity.groups.claude, windows: [{ id: "5h", usedPercent: 150, resetsAt: "x" }] } } };
+    expect(parseCapacity(broken).ok).toBe(false);
+  });
+
+  it("points the CLI at the gateway origin, not the capacity origin", () => {
+    const broker = new CapacityBroker({ baseUrl: "https://capacity.internal", gatewayBaseUrl: "https://gateway.internal" });
+    const auth = broker.auth({ id: "claude-max", provider: "claude", group: "claude", model: "m", permission: "plan" });
+    expect(auth).toEqual({ mode: "broker", baseUrl: "https://gateway.internal", keyRef: "env:MORPHEUS_FACTORY_KEY_CLAUDE_MAX" });
+  });
+
+  it("defaults the gateway origin to the capacity origin", () => {
+    const broker = new CapacityBroker({ baseUrl: "https://broker.test" });
+    const auth = broker.auth({ id: "claude-max", provider: "claude", group: "claude", model: "m", permission: "plan" });
+    if (auth.mode !== "broker") throw new Error("expected broker auth");
+    expect(auth.baseUrl).toBe("https://broker.test");
+  });
+});

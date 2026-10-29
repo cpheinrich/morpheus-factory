@@ -93,3 +93,28 @@ describe("admit", () => {
     expect(result.refusal.code).toBe("no-healthy-account");
   });
 });
+
+describe("admit — concurrency is never waived", () => {
+  const relaxed = { stopAtPercent: 90, requireKnownQuota: false };
+
+  it("still refuses at the slot cap when quota windows are absent", () => {
+    const usage = group({ windows: [], inFlight: 5, maxConcurrency: 5 });
+    const result = admit(claudeMax, snapshotWith(usage), relaxed);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.refusal.code).toBe("concurrency-exhausted");
+  });
+
+  it("still refuses at the slot cap when a window is unreadable", () => {
+    const usage = group({ windows: [{ id: "5h", usedPercent: Number.NaN, resetsAt: "x" }], inFlight: 5, maxConcurrency: 5 });
+    const result = admit(claudeMax, snapshotWith(usage), relaxed);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.refusal.code).toBe("concurrency-exhausted");
+  });
+
+  it("admits below the cap when quota is unknown and relaxed", () => {
+    const usage = group({ windows: [], inFlight: 4, maxConcurrency: 5 });
+    expect(admit(claudeMax, snapshotWith(usage), relaxed)).toEqual({ ok: true });
+  });
+});

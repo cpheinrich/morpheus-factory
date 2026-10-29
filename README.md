@@ -109,6 +109,7 @@ groups, and should live with the operator, not in the repo.
 |---|---|
 | `broker.kind` | `sub2api` (capacity contract) or `native` (no broker) |
 | `broker.baseUrl` | Adapter origin that publishes capacity; https except loopback |
+| `broker.gatewayBaseUrl` | Origin workers point their CLI at; defaults to `baseUrl` |
 | `degradedMode` | `native` — fall back per host; `refuse` — stop and requeue |
 | `policy.stopAtPercent` | Refuse at or above this usage on any window |
 | `policy.requireKnownQuota` | Refuse when capacity cannot be proven |

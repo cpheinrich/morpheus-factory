@@ -4,6 +4,8 @@ import type { Auth, BrokerPort } from "./port.js";
 export interface CapacityBrokerOptions {
   /** Origin of the adapter that publishes capacity. Never a provider origin. */
   baseUrl: string;
+  /** Origin workers point their CLI at for inference. Defaults to `baseUrl`. */
+  gatewayBaseUrl?: string;
   /** Env var holding the capacity token; the token itself is never stored here. */
   tokenEnv?: string;
   timeoutMs?: number;
@@ -31,6 +33,7 @@ export interface CapacityBrokerOptions {
 export class CapacityBroker implements BrokerPort {
   readonly id = "capacity";
   readonly baseUrl: string;
+  readonly gatewayBaseUrl: string;
   #tokenEnv: string | undefined;
   #timeoutMs: number;
   #fetch: typeof globalThis.fetch;
@@ -38,6 +41,7 @@ export class CapacityBroker implements BrokerPort {
 
   constructor(options: CapacityBrokerOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
+    this.gatewayBaseUrl = (options.gatewayBaseUrl ?? options.baseUrl).replace(/\/+$/, "");
     this.#tokenEnv = options.tokenEnv;
     this.#timeoutMs = options.timeoutMs ?? 5_000;
     this.#fetch = options.fetch ?? globalThis.fetch;
@@ -80,7 +84,7 @@ export class CapacityBroker implements BrokerPort {
   auth(profile: Profile): Auth {
     return {
       mode: "broker",
-      baseUrl: this.baseUrl,
+      baseUrl: this.gatewayBaseUrl,
       keyRef: profile.keyRef ?? `env:MORPHEUS_FACTORY_KEY_${envSuffix(profile.id)}`,
     };
   }
@@ -130,7 +134,7 @@ function parseGroup(value: unknown): GroupUsage | null {
     const window = entry as Record<string, unknown>;
     const id = window.id;
     const usedPercent = number(window.usedPercent);
-    if (typeof id !== "string" || id === "" || usedPercent === null) return null;
+    if (typeof id !== "string" || id === "" || usedPercent === null || usedPercent > 100) return null;
     windows.push({ id, usedPercent, resetsAt: typeof window.resetsAt === "string" ? window.resetsAt : "" });
   }
   return { inFlight, maxConcurrency, healthyAccounts, windows };

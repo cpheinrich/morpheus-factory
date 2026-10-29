@@ -2,8 +2,18 @@ import type { Host, Permission, Profile, ProviderId } from "./types.js";
 
 export interface BrokerConfig {
   kind: "sub2api" | "native";
-  /** Required for sub2api; the origin every worker points its CLI at. */
+  /**
+   * Origin of the capacity adapter. Required for sub2api. In the common case
+   * this is also where workers send inference, but the two are distinct: see
+   * `gatewayBaseUrl`.
+   */
   baseUrl?: string;
+  /**
+   * Origin workers point their CLI at for inference. Defaults to `baseUrl`.
+   * Separate because the capacity adapter and the gateway may be different
+   * hosts, and a run spec must never point a CLI at the capacity endpoint.
+   */
+  gatewayBaseUrl?: string;
   timeoutMs?: number;
 }
 
@@ -66,6 +76,17 @@ export function parseConfig(raw: unknown): { ok: true; config: FactoryConfig } |
           add("broker.baseUrl", "must be an https URL, or http on localhost");
         } else {
           broker.baseUrl = baseUrl.replace(/\/+$/, "");
+        }
+
+        const gatewayBaseUrl = brokerRaw.gatewayBaseUrl;
+        if (gatewayBaseUrl === undefined) {
+          broker.gatewayBaseUrl = broker.baseUrl;
+        } else if (!isNonEmptyString(gatewayBaseUrl)) {
+          add("broker.gatewayBaseUrl", "must be a URL when present");
+        } else if (!isAllowedOrigin(gatewayBaseUrl)) {
+          add("broker.gatewayBaseUrl", "must be an https URL, or http on localhost");
+        } else {
+          broker.gatewayBaseUrl = gatewayBaseUrl.replace(/\/+$/, "");
         }
       }
       if (brokerRaw.timeoutMs !== undefined) {
@@ -146,6 +167,9 @@ function parseHosts(raw: unknown, add: (path: string, message: string) => void):
         return add(`${path}.workspaces[${i}]`, "must be an absolute path");
       }
       paths.push(workspace.replace(/\/+$/, ""));
+    }
+    if (entry.healthy !== undefined && typeof entry.healthy !== "boolean") {
+      return add(`${path}.healthy`, "must be a boolean");
     }
     hosts.push({
       id,

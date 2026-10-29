@@ -101,3 +101,34 @@ describe("parseConfig", () => {
     expect(result.issues[0]?.path).toBe("hosts[0].workspaces[0]");
   });
 });
+
+describe("parseConfig — host health and gateway origin", () => {
+  it("rejects a non-boolean healthy flag instead of coercing it", () => {
+    const result = parseConfig({ ...base, hosts: [{ ...base.hosts[0], healthy: "false" }] });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.issues[0]?.path).toBe("hosts[0].healthy");
+  });
+
+  it("defaults the gateway origin to the capacity origin", () => {
+    const result = parseConfig(base);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.config.broker.gatewayBaseUrl).toBe("https://broker.example.test");
+  });
+
+  it("keeps a distinct gateway origin when one is given", () => {
+    const result = parseConfig({ ...base, broker: { kind: "sub2api", baseUrl: "https://capacity.internal", gatewayBaseUrl: "https://gateway.internal" } });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.config.broker.baseUrl).toBe("https://capacity.internal");
+    expect(result.config.broker.gatewayBaseUrl).toBe("https://gateway.internal");
+  });
+
+  it("rejects an insecure gateway origin", () => {
+    const result = parseConfig({ ...base, broker: { kind: "sub2api", baseUrl: "https://capacity.internal", gatewayBaseUrl: "http://gateway.internal" } });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.issues[0]?.path).toBe("broker.gatewayBaseUrl");
+  });
+});

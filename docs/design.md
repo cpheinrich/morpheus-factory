@@ -89,7 +89,9 @@ Two boundaries are deliberate and tested:
 An unreadable percentage, an empty window set, or a missing group is
 `quota-unknown`, never "zero usage". When `requireKnownQuota` is false those
 admit, which is only appropriate for `native` deployments where the host's own
-quota command remains the execution-time gate.
+quota command remains the execution-time gate. **Concurrency is never waived**:
+the slot cap is a hard safety limit and is enforced even when quota is unknown,
+so a relaxed quota policy cannot silently admit past it.
 
 ## The broker port
 
@@ -116,6 +118,11 @@ This is intentionally **not** a sub2api client. The gateway's admin payloads are
 version-specific and shaped for its own UI; a broker upgrade must not be able to
 break placement. A small adapter publishes this document from the gateway — or
 from anything else that can answer the same question.
+
+The capacity origin and the gateway origin are distinct fields
+(`baseUrl` vs `gatewayBaseUrl`). A run spec's `auth.baseUrl` is always the
+gateway origin, never the capacity endpoint, so a CLI can never be pointed at
+the wrong host when the adapter and the gateway live apart.
 
 `NativeBroker` returns no groups. It exists so a broker outage degrades the
 fleet instead of stopping it.

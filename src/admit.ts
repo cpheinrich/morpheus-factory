@@ -15,6 +15,8 @@ export function admit(profile: Profile, snapshot: BrokerSnapshot, policy: Policy
 
   const usage = snapshot.groups[profile.group];
   if (usage === undefined) {
+    // No group means no data at all — nothing to gate on, so the only question
+    // is whether the operator accepts unproven capacity.
     return policy.requireKnownQuota
       ? { ok: false, refusal: { code: "quota-unknown", detail: `broker reports no group "${profile.group}"` } }
       : { ok: true };
@@ -24,31 +26,39 @@ export function admit(profile: Profile, snapshot: BrokerSnapshot, policy: Policy
     return { ok: false, refusal: { code: "no-healthy-account", detail: `group "${profile.group}" has no eligible account` } };
   }
 
+  // Quota is the only gate that may be waived. Concurrency is a hard safety
+  // limit and is enforced below regardless, so a relaxed quota policy can never
+  // silently admit past the slot cap.
+  let quotaKnown = true;
   if (usage.windows.length === 0) {
-    return policy.requireKnownQuota
-      ? { ok: false, refusal: { code: "quota-unknown", detail: `group "${profile.group}" reports no quota windows` } }
-      : { ok: true };
+    if (policy.requireKnownQuota) {
+      return { ok: false, refusal: { code: "quota-unknown", detail: `group "${profile.group}" reports no quota windows` } };
+    }
+    quotaKnown = false;
+  } else {
+    const unreadable = usage.windows.find((window) => !isReadable(window));
+    if (unreadable !== undefined) {
+      if (policy.requireKnownQuota) {
+        return { ok: false, refusal: { code: "quota-unknown", detail: `window "${unreadable.id}" reported an unusable percentage` } };
+      }
+      quotaKnown = false;
+    }
   }
 
-  const unreadable = usage.windows.find((window) => !isReadable(window));
-  if (unreadable !== undefined) {
-    return policy.requireKnownQuota
-      ? { ok: false, refusal: { code: "quota-unknown", detail: `window "${unreadable.id}" reported an unusable percentage` } }
-      : { ok: true };
-  }
-
-  // At the threshold, refuse: the next turn would push past it, and the cost of
-  // waiting is a requeue while the cost of overshooting is a provider rate limit
-  // that strands every worker in the group.
-  const blocked = usage.windows.find((window) => window.usedPercent >= policy.stopAtPercent);
-  if (blocked !== undefined) {
-    return {
-      ok: false,
-      refusal: {
-        code: "quota-exhausted",
-        detail: `window "${blocked.id}" is ${blocked.usedPercent}% used (stop at ${policy.stopAtPercent}%), resets ${blocked.resetsAt}`,
-      },
-    };
+  if (quotaKnown) {
+    // At the threshold, refuse: the next turn would push past it, and the cost
+    // of waiting is a requeue while the cost of overshooting is a provider rate
+    // limit that strands every worker in the group.
+    const blocked = usage.windows.find((window) => window.usedPercent >= policy.stopAtPercent);
+    if (blocked !== undefined) {
+      return {
+        ok: false,
+        refusal: {
+          code: "quota-exhausted",
+          detail: `window "${blocked.id}" is ${blocked.usedPercent}% used (stop at ${policy.stopAtPercent}%), resets ${blocked.resetsAt}`,
+        },
+      };
+    }
   }
 
   if (usage.inFlight >= usage.maxConcurrency) {

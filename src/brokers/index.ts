@@ -14,5 +14,5 @@ export function createBroker(config: BrokerConfig, now: () => Date = () => new D
   if (config.baseUrl === undefined) {
     throw new Error("broker.baseUrl is required for the capacity broker; configuration was not validated");
   }
-  return new CapacityBroker({ baseUrl: config.baseUrl, timeoutMs: config.timeoutMs, now });
+  return new CapacityBroker({ baseUrl: config.baseUrl, gatewayBaseUrl: config.gatewayBaseUrl, timeoutMs: config.timeoutMs, now });
 }

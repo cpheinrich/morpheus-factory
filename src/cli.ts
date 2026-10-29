@@ -71,7 +71,7 @@ async function main(argv: string[]): Promise<number> {
   }
 
   if (command === "plan") {
-    if (flags.task === undefined || flags.profile === undefined) {
+    if (flags.task === undefined || flags.task === "" || flags.profile === undefined || flags.profile === "") {
       process.stderr.write("factory: plan requires --task and --profile\n");
       return CONFIG;
     }
