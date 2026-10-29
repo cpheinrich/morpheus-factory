@@ -285,7 +285,7 @@ def update_worker_lease(udid, minutes, release):
         log(f"Leased simulator {udid} for {minutes} minutes")
 
 
-def remove_old_simulators(qa_days, job_days, apply):
+def remove_old_simulators(qa_days, job_days, apply, manual=False):
     if not shutil.which("xcrun"):
         log("xcrun unavailable; skipping simulators")
         return 0
@@ -311,7 +311,12 @@ def remove_old_simulators(qa_days, job_days, apply):
             is_job = bool(CI_NAME.fullmatch(name) or CLONE_NAME.fullmatch(name))
             if not (is_qa or is_job) or device["state"] != "Shutdown":
                 continue
-            directory = Path(device.get("dataPath") or devices_root / udid)
+            data_path = Path(device.get("dataPath") or devices_root / udid)
+            # CoreSimulator may touch every data directory during a runtime update.
+            # An explicit manual cleanup uses the device's own age; the watchdog
+            # remains conservative and uses the latest data-directory change.
+            directory = (data_path.parent if manual and data_path.name == "data"
+                         and data_path.parent.name == udid else data_path)
             if not directory.is_dir() or directory.is_symlink():
                 continue
             days = qa_days if is_qa else job_days
@@ -381,7 +386,8 @@ def main():
         log(f"Development cleanup: {'apply' if apply else 'dry run'}")
 
     def simulators():
-        count = remove_old_simulators(args.simulator_days, args.job_simulator_days, apply)
+        count = remove_old_simulators(args.simulator_days, args.job_simulator_days,
+                                      apply, manual=args.apply)
         log(f"Unowned shutdown QA and CI/CD simulators: {count}")
 
     def installers():
@@ -398,7 +404,8 @@ def main():
             log("xcodebuild running; skipping DerivedData")
         else:
             count = remove_old_children(
-                HOME / "Library/Developer/Xcode/DerivedData", args.build_days, apply
+                HOME / "Library/Developer/Xcode/DerivedData",
+                0 if args.apply else args.build_days, apply
             )
             log(f"Old DerivedData directories: {count}")
 

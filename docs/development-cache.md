@@ -49,7 +49,13 @@ earlier cleanup stages have not restored the target. It uses `mdutil -E` and
 restores the volume's previous indexing state; it never removes index files
 directly.
 
-The script is dry-run by default; `--apply` performs a full manual cleanup.
+The script is dry-run by default; `--apply` performs a full manual cleanup
+regardless of free space. An explicit manual run clears all Xcode DerivedData
+when no build is running. For named shutdown QA and job simulators, it uses the
+device directory's age; a CoreSimulator runtime update can touch every `data`
+directory without making those devices newly used. The hourly watchdog keeps
+the more conservative `data` directory age check and the 30-day DerivedData
+cutoff. Both modes retain booted devices, active leases and supervisors.
 The `--watch` mode runs hourly. It removes home Trash entries older than 30
 days even when free space is healthy, and leaves caches alone while free space
 is above the reserve. The Trash cutoff uses the later of creation time and
