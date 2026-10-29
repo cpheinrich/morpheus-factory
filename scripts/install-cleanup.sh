@@ -28,6 +28,8 @@ mkdir -p "$bin_dir" "$agent_dir" "$log_dir" "$config_dir"
 printf '%s\n' "$code_root" > "$config_dir/code-root"
 install -m 755 "$repo_dir/scripts/cleanup-development-cache.py" "$bin_dir/morpheus-development-cleanup"
 install -m 755 "$repo_dir/scripts/cleanup-old-worktrees.py" "$bin_dir/cleanup-old-worktrees.py"
+install -m 755 "$repo_dir/worker/setup/apps.sh" "$bin_dir/morpheus-unused-apps-cleanup"
+install -m 755 "$repo_dir/worker/setup/spotlight.sh" "$bin_dir/morpheus-spotlight-exclusions"
 cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

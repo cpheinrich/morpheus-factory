@@ -130,7 +130,9 @@ Run `bash worker/setup.sh` from a clone on a new Mac. Its
 [setup stages](worker/README.md) remove unused Apple apps, install local tool prerequisites, build factory,
 check out Morpheus, exclude development roots from Spotlight, and install the
 [hourly storage watchdog](docs/development-cache.md), including 30-day Trash retention,
-guarded old-worktree cleanup and a 5 GiB SwiftPM cache threshold. Use `--check` to inspect
+guarded old-worktree cleanup, installed-app installer removal and a 5 GiB SwiftPM cache threshold.
+The watchdog starts pressure cleanup below the greater of 50 GiB or 15% free space.
+Use `--check` to inspect
 the host without changing it. This is the first stage of the single-command
 worker setup: fleet activation still needs broker configuration, provider CLIs
 and the Morpheus execution adapter.

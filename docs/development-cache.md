@@ -15,7 +15,7 @@ sum is not an exact promise of free space.
 | Playwright browsers | 2.1 GiB | Keep; they are installed test dependencies. |
 | Codex data | 5.2 GiB | About 2.4 GiB installed runtimes, 1.4 GiB managed worktrees, 0.4 GiB session history, and 0.4 GiB plugins. Keep these; only explicit app caches (about 54 MiB) are pressure-cleanup candidates while Codex is closed. |
 | SwiftPM cache | 1.5 GiB | Keep unless it exceeds 5 GiB during storage pressure; then use SwiftPM's purge command while builds are idle. |
-| Xcode DerivedData | 713 MiB | Remove directories idle 30 days, only with no `xcodebuild`. |
+| Xcode DerivedData | 713 MiB | Remove directories idle 7 days while Xcode and Swift builds are closed; if pressure persists after Spotlight, fall back to directories idle 1 day, oldest first, stopping at the target reserve. |
 | Homebrew downloads | 274 MiB | `brew cleanup --prune=30`. |
 | pip cache | 106 MiB | Purge when pip is present. |
 | Browser and app caches | about 1.3 GiB for Brave alone | Keep; browser sessions are in use. |
@@ -24,13 +24,35 @@ sum is not an exact promise of free space.
 | Tart per-repo cache disks | 31 GiB | Keep active repo/slot disks; Evo uses 21 GiB, Lakina 4.3 GiB, Kairos 5.2 GiB. |
 | MorpheusCD runtime/state | 6.3 GiB | Keep; includes durable CD data and checkouts, not classified as cache. |
 | Claude app support | 12 GiB | Keep the 11.3 GiB VM bundle and session data. About 0.6 GiB of named browser, code and GPU caches can be cleared under pressure while Claude is closed. Claude CLI data in `~/.claude` is only 16 MiB. |
-| Spotlight index | 69 GiB | Reset once with `mdutil -E` after a 64 GiB index file was found; indexing re-enabled. Do not delete its files in the watchdog. |
-| Apple consumer apps and audio content | about 8.5 GiB | iMovie, GarageBand, Keynote, Pages and Numbers, plus orphaned GarageBand/Logic/Apple Loops content, removed; worker setup removes them on new hosts. |
-| Downloads installers | 5+ GiB | Removed Xcode archives and installers for installed apps. Keep unrelated downloads. |
+| Spotlight index | 69 GiB | Reset once with `mdutil -E` after a 64 GiB index file was found; indexing re-enabled. The watchdog resets an oversized index under pressure after applying development-root exclusions. |
+| Apple consumer apps and audio content | about 8.5 GiB | iMovie, GarageBand, Keynote, Pages and Numbers, plus orphaned GarageBand/Logic/Apple Loops content, removed; both worker setup and pressure cleanup use the same guarded helper. |
+| Downloads installers | 5+ GiB | Remove Xcode `.xip` files and `.dmg`/`.pkg` installers whose names match installed apps, regardless of file age. Keep unrelated downloads. |
 | `/private/tmp` build data | 7.7 GiB | Recent Evo DerivedData and SwiftPM packages; leave until the owning work finishes. |
 | Morpheus/OpenClaw worktrees | about 15 GiB | Review through each owner's worktree cleanup command, not a generic age rule. |
 | OpenClaw workspace and temp | 19 GiB | Includes working checkouts and recent temporary jobs; no automatic deletion without ownership metadata. |
 | Large media files | under 1 GiB | One 0.41 GiB macOS aerial wallpaper video remained after GarageBand lesson content was removed. No large personal media collection found. |
+
+## Reconciliation with the original cleanup
+
+The largest one-time gains on this Mac were Spotlight (about 69 GiB), unused
+Apple apps and audio content (about 8.5 GiB), and downloaded installers (more
+than 5 GiB). The first watchdog version had Spotlight only in `--watch`, Apple
+app removal only in worker setup, and a short installer allowlist with a 30-day
+wait. The current cleanup command covers those same categories: it runs the
+Apple app helper under pressure or with `--apply`, matches installed-app
+installers immediately, and checks Spotlight when either mode runs below the
+reserve. It still defers Spotlight until earlier stages fail to reach the
+target, as requested. A 1 TB worker with about 100 GiB free now enters pressure
+cleanup: its default trigger is about 140 GiB and target about 170 GiB.
+
+The rest of the original audit was either already in the script (old named
+simulators, npm, pnpm, uv, Homebrew, DerivedData, guarded worktrees and old
+Trash), retained for active work (Tart VM images and slot cache disks, SwiftPM
+under 5 GiB, Codex runtimes), or durable state (repositories, session history,
+release archives and CD state). The script reports free space before and after
+each run. An applied cleanup that cannot restore the reserve exits with code 2,
+so the remaining pressure is visible rather than reported as a
+successful full reclamation.
 
 The deeper audit found about 69 GiB hidden under the root-owned Spotlight store.
 On this Mac, `sudo -n mdutil -E /System/Volumes/Data` reclaimed it, and
@@ -49,20 +71,23 @@ earlier cleanup stages have not restored the target. It uses `mdutil -E` and
 restores the volume's previous indexing state; it never removes index files
 directly.
 
-The script is dry-run by default; `--apply` performs a full manual cleanup.
+The script is dry-run by default; `--apply` performs eligible manual cleanup.
 The `--watch` mode runs hourly. It removes home Trash entries older than 30
 days even when free space is healthy, and leaves caches alone while free space
 is above the reserve. The Trash cutoff uses the later of creation time and
 inode change time, so recently moved or modified entries are retained; Finder
-metadata is left alone. Its floor is the greater of 50 GiB or 10% of the data volume; once
+metadata is left alone. Its floor is the greater of 50 GiB or 15% of the data volume; once
 below that floor, it runs eligible cleanup stages in order until free space is
-30 GiB above the floor. It starts with old installers, unowned simulators and build outputs;
+30 GiB above the floor. It starts with installed-app installers, unused Apple
+apps, unowned simulators and build outputs idle for at least 7 days;
 SwiftPM is purged only when its global cache exceeds 5 GiB and no Swift or
 Xcode build is running. Its repository cache uses `swift package purge-cache`;
 the same stage clears its downloaded artifacts and compiled manifests, which
 that command leaves behind. Package-store pruning, closed-agent-app cache removal,
 guarded old-worktree removal and an oversized Spotlight
-index reset are later stages. The job requires the
+index reset are later stages. If the reserve is still below target, it removes
+DerivedData directories idle for at least one day, oldest first, while builds
+are inactive. The job requires the
 user's macOS login session, and writes logs under
 `~/Library/Logs/morpheus-factory/`.
 It skips a package manager's cache while that tool is active.
@@ -70,9 +95,12 @@ The Claude and Codex stage removes only contents of explicitly named cache
 directories, and only while the corresponding app is closed. It leaves VM
 bundles, installed runtimes, session history, browser profiles, plugin installs
 and managed worktrees to their owners.
-Installer cleanup only recognizes Xcode `.xip` files and known `.dmg` or app
-installers in Downloads that are at least 30 days old. Non-Xcode installers
-also require the app to be present in Applications.
+Installer cleanup recognizes Xcode `.xip` files and `.dmg`/`.pkg` or named
+installer apps in Downloads when the corresponding app is installed in
+`/Applications` or `~/Applications`. It does not wait 30 days after an app is
+already installed. The cleanup command also invokes worker setup's unused
+Apple app and orphaned audio-content helper during pressure cleanup; manual
+`--apply` invokes it regardless of the reserve.
 
 Old Morpheus task worktrees are a late pressure-cleanup stage. It scans known
 repository roots for linked task worktrees at least 14 days old, clears Git
@@ -90,7 +118,7 @@ already missing and removed one clean, proven-merged `cpheinrich.com` task
 worktree (PR #198). Other sampled candidates were retained for active task
 status, ignored local data, or persistent agent bindings.
 
-Worker setup places `.metadata_never_index` markers in existing source,
+Worker setup and pressure cleanup place `.metadata_never_index` markers in existing source,
 worktree, VM and cache roots. On this Mac the same development roots were also
 added to Spotlight Search Privacy through System Settings. The markers are
 macOS Spotlight's folder-level exclusion mechanism and need to be reapplied
