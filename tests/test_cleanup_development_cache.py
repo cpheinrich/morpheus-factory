@@ -47,6 +47,20 @@ class SimulatorOwnershipTests(unittest.TestCase):
                 self.assertEqual(cleanup.main(), expected_exit)
                 self.assertEqual(stages.call_args.args[1], 80)
 
+    def test_manual_cleanup_clears_derived_data_without_age_limit(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(cleanup, "HOME", Path(directory)), \
+             patch.object(cleanup.sys, "argv", ["cleanup", "--apply"]), \
+             patch.object(cleanup, "execute_stages", return_value=[]) as stages, \
+             patch.object(cleanup, "remove_old_children", return_value=1) as remove, \
+             patch.object(cleanup.subprocess, "run", return_value=Mock(returncode=1)):
+            self.assertEqual(cleanup.main(), 0)
+            actions = dict(stages.call_args.args[0])
+            actions["DerivedData"]()
+            remove.assert_called_once_with(
+                Path(directory) / "Library/Developer/Xcode/DerivedData", 0, True)
+            self.assertIsNone(stages.call_args.args[1])
+
     def test_installer_cleanup_limits_scope_and_age(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -254,6 +268,33 @@ class SimulatorOwnershipTests(unittest.TestCase):
                  patch.object(cleanup, "worker_lease_is_active", return_value=False), \
                  patch.object(cleanup, "run") as delete:
                 self.assertEqual(cleanup.remove_old_simulators(14, 2, True), 1)
+                delete.assert_called_once_with(["xcrun", "simctl", "delete", udid], True)
+
+    def test_manual_cleanup_uses_device_age_after_data_directory_was_touched(self):
+        udid = "11111111-2222-3333-4444-555555555555"
+        with tempfile.TemporaryDirectory() as directory:
+            device_root = Path(directory) / udid
+            data = device_root / "data"
+            data.mkdir(parents=True)
+            old = time.time() - 20 * cleanup.DAY
+            os.utime(device_root, (old, old))
+            device = {"name": "Evo QA 123456abcdef", "udid": udid,
+                      "state": "Shutdown", "dataPath": str(data)}
+            inventory = json.dumps({"devices": {"ios": [device]}})
+
+            def output(command, **_kwargs):
+                return inventory if command[:2] == ["xcrun", "simctl"] else ""
+
+            with patch.object(cleanup.shutil, "which", return_value="xcrun"), \
+                 patch.object(cleanup.subprocess, "check_output", side_effect=output), \
+                 patch.object(cleanup.subprocess, "run", return_value=Mock(
+                     returncode=1, stderr="Provided set path does not exist")), \
+                 patch.object(cleanup, "preview_is_owned", return_value=False), \
+                 patch.object(cleanup, "worker_lease_is_active", return_value=False), \
+                 patch.object(cleanup, "run") as delete:
+                self.assertEqual(cleanup.remove_old_simulators(14, 2, True), 0)
+                delete.assert_not_called()
+                self.assertEqual(cleanup.remove_old_simulators(14, 2, True, manual=True), 1)
                 delete.assert_called_once_with(["xcrun", "simctl", "delete", udid], True)
 
 
