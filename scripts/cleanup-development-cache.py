@@ -25,7 +25,7 @@ QA_NAME = re.compile(r"Evo QA [0-9a-f]{12}\Z")
 JOB_ID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 CI_NAME = re.compile(rf"(?:Morpheus CI|Evo Test|Lakina Test) {JOB_ID}\Z")
 CLONE_NAME = re.compile(rf"Clone [0-9]+ of Morpheus CI {JOB_ID}\Z")
-XCODE_INSTALLER = re.compile(r"Xcode_[0-9]+(?:\.[0-9]+)*(?:_Apple_silicon)?\.xip\Z")
+XCODE_INSTALLER = re.compile(r"Xcode(?:[._ -].*)?\.xip\Z", re.IGNORECASE)
 DAY = 86400
 LEASE_DIR = HOME / ".local/state/morpheus-factory/simulator-leases"
 UDID = re.compile(JOB_ID + r"\Z")
@@ -76,8 +76,8 @@ def reset_large_spotlight_index(apply, limit_gib=5):
     return True
 
 
-def watch_limits(total_gib, base_floor=50):
-    floor = max(base_floor, math.ceil(total_gib * 0.10))
+def watch_limits(total_gib, base_floor=50, min_free_percent=15):
+    floor = max(base_floor, math.ceil(total_gib * min_free_percent / 100))
     return floor, floor + 30
 
 
@@ -95,14 +95,21 @@ def execute_stages(stages, target=None, free_space=None):
     return failures
 
 
-def remove_old_children(parent, days, apply):
+def remove_old_children(parent, days, apply, target=None):
     if not parent.is_dir() or parent.is_symlink():
         return 0
     cutoff = time.time() - days * DAY
     count = 0
-    for path in sorted(parent.iterdir()):
-        if path.is_symlink() or not path.is_dir() or path.stat().st_mtime >= cutoff:
+    candidates = []
+    for path in parent.iterdir():
+        if path.is_symlink() or not path.is_dir():
             continue
+        modified = path.stat().st_mtime
+        if modified < cutoff:
+            candidates.append((modified, path))
+    for _, path in sorted(candidates, key=lambda item: (item[0], str(item[1]))):
+        if target is not None and space_gib()[0] >= target:
+            break
         log(f"{'Remove' if apply else 'Would remove'} {path}")
         if apply:
             shutil.rmtree(path)
@@ -110,46 +117,47 @@ def remove_old_children(parent, days, apply):
     return count
 
 
-def remove_old_installers(downloads, days, apply, applications=Path("/Applications")):
-    """Only remove recognized Downloads installers, never arbitrary archives."""
+def remove_installed_app_installers(downloads, apply, applications=Path("/Applications")):
+    """Remove Downloads installers that match an installed application name."""
     if not downloads.is_dir() or downloads.is_symlink():
         return 0
-    cutoff = time.time() - days * DAY
     candidates = list(downloads.iterdir())
     ibkr = downloads / "ibkr"
     if ibkr.is_dir() and not ibkr.is_symlink():
         candidates.extend(ibkr.iterdir())
-    installed = {
-        "Brave-Browser.dmg": "Brave Browser.app",
-        "Claude.dmg": "Claude.app",
-        "Hermes-Setup.dmg": "Hermes.app",
-        "1Password Installer.app": "1Password.app",
-        "ibgateway-stable-standalone-macos-arm.dmg": "IB Gateway",
-    }
-    prefixes = {
-        "Slack-": "Slack.app",
-        "MacLock-": "MacLock.app",
-        "Zed-": "Zed.app",
-    }
+    installed = []
+    for root in (applications, HOME / "Applications"):
+        if root.is_dir() and not root.is_symlink():
+            installed.extend(app.stem for app in root.glob("*.app") if app.is_dir() and not app.is_symlink())
+    xcode_installed = any(name.lower().startswith("xcode") for name in installed)
+
+    def matches_app(stem):
+        for app in installed:
+            parts = re.findall(r"[a-z0-9]+", app.lower())
+            while parts and parts[-1].isdigit():
+                parts.pop()
+            if not parts:
+                continue
+            prefix = r"[\s._-]*".join(re.escape(part) for part in parts)
+            if re.match(rf"^{prefix}(?:[\s._-]|$)", stem.lower()):
+                return True
+        return False
+
     count = 0
     for path in sorted(candidates):
-        if path.is_symlink() or not (path.is_file() or path.name == "1Password Installer.app" and path.is_dir()):
+        if path.is_symlink():
             continue
-        if path.stat().st_mtime >= cutoff:
+        suffix = path.suffix.lower()
+        installer_app = suffix == ".app" and path.is_dir() and path.stem.lower().endswith(" installer")
+        if not (suffix in (".dmg", ".pkg", ".xip") and path.is_file() or installer_app):
             continue
-        if XCODE_INSTALLER.fullmatch(path.name):
-            eligible = True
+        if suffix == ".xip":
+            eligible = bool(XCODE_INSTALLER.fullmatch(path.name) and xcode_installed)
         else:
-            app = installed.get(path.name)
-            if app is None and path.suffix == ".dmg":
-                app = next((value for prefix, value in prefixes.items() if path.name.startswith(prefix)), None)
-            if app == "IB Gateway":
-                eligible = any((HOME / "Applications").glob("IB Gateway *"))
-            else:
-                eligible = app is not None and (applications / app).is_dir()
+            eligible = matches_app(path.stem)
         if not eligible:
             continue
-        log(f"{'Remove' if apply else 'Would remove'} old installer {path}")
+        log(f"{'Remove' if apply else 'Would remove'} installed-app installer {path}")
         if apply:
             if path.is_dir():
                 shutil.rmtree(path)
@@ -184,6 +192,12 @@ def remove_old_trash(trash, days, apply):
 def swift_build_is_running():
     commands = subprocess.check_output(["ps", "ax", "-o", "comm="], text=True)
     return any(Path(command).name in ("swift", "swiftc", "swift-frontend", "xcodebuild")
+               for command in commands.splitlines())
+
+
+def xcode_editor_is_running():
+    commands = subprocess.check_output(["ps", "ax", "-o", "comm="], text=True)
+    return any(re.search(r"/Xcode(?:-beta)?\.app/Contents/MacOS/Xcode\Z", command)
                for command in commands.splitlines())
 
 
@@ -337,14 +351,15 @@ def remove_old_simulators(qa_days, job_days, apply):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--apply", action="store_true", help="perform a full manual cleanup")
-    mode.add_argument("--watch", action="store_true", help="clean only below the free-space reserve")
+    mode.add_argument("--apply", action="store_true", help="perform eligible manual cleanup; Spotlight still requires storage pressure")
+    mode.add_argument("--watch", action="store_true", help="hourly Trash retention and pressure-based cache cleanup")
     parser.add_argument("--min-free-gb", type=int, default=50,
-                        help="minimum reserve; watchdog also uses 10%% of volume capacity")
+                        help="minimum reserve; watchdog also uses a percentage of volume capacity")
+    parser.add_argument("--min-free-percent", type=int, default=15,
+                        help="minimum free-space percentage for the watchdog (default: 15)")
     parser.add_argument("--simulator-days", type=int, default=14)
-    parser.add_argument("--build-days", type=int, default=30)
+    parser.add_argument("--build-days", type=int, default=7)
     parser.add_argument("--job-simulator-days", type=int, default=2)
-    parser.add_argument("--installer-days", type=int, default=30)
     parser.add_argument("--trash-days", type=int, default=30)
     lease = parser.add_mutually_exclusive_group()
     lease.add_argument("--lease-udid")
@@ -354,10 +369,12 @@ def main():
     if sys.platform != "darwin":
         parser.error("macOS required")
     if (args.simulator_days < 2 or args.build_days < 7 or args.job_simulator_days < 2
-            or args.installer_days < 7 or args.trash_days < 30):
+            or args.trash_days < 30):
         parser.error("retention is too short")
     if args.min_free_gb < 10:
         parser.error("minimum free space must be at least 10 GiB")
+    if not 5 <= args.min_free_percent <= 50:
+        parser.error("minimum free percentage must be 5–50")
     if not 1 <= args.lease_minutes <= 1440:
         parser.error("lease minutes must be 1–1440")
     if args.lease_udid or args.release_udid:
@@ -372,35 +389,64 @@ def main():
     healthy_watch = False
     if args.watch:
         available, total = space_gib()
-        floor, target = watch_limits(total, args.min_free_gb)
+        floor, target = watch_limits(total, args.min_free_gb, args.min_free_percent)
         log(f"Storage watchdog: {available:.1f} GiB free; floor {floor} GiB; target {target} GiB")
         if available >= floor:
             healthy_watch = True
             log("Reserve healthy; checking old Trash entries only")
     else:
-        log(f"Development cleanup: {'apply' if apply else 'dry run'}")
+        available, total = space_gib()
+        floor, _ = watch_limits(total, args.min_free_gb, args.min_free_percent)
+        log(f"Development cleanup: {'apply' if apply else 'dry run'}; "
+            f"{available:.1f} GiB free; pressure floor {floor} GiB")
+    pressure = available < floor
 
     def simulators():
         count = remove_old_simulators(args.simulator_days, args.job_simulator_days, apply)
         log(f"Unowned shutdown QA and CI/CD simulators: {count}")
 
     def installers():
-        count = remove_old_installers(HOME / "Downloads", args.installer_days, apply)
-        log(f"Old recognized installers: {count}")
+        count = remove_installed_app_installers(HOME / "Downloads", apply)
+        log(f"Installed-app installers: {count}")
 
     def trash():
         count = remove_old_trash(HOME / ".Trash", args.trash_days, apply)
         log(f"Trash entries older than {args.trash_days} days: {count}")
 
-    def derived_data():
-        # A running build may be writing inside an old DerivedData directory.
-        if subprocess.run(["pgrep", "-f", "[x]codebuild"], stdout=subprocess.DEVNULL).returncode == 0:
-            log("xcodebuild running; skipping DerivedData")
+    def unused_apple_apps():
+        helper = Path(__file__).with_name("morpheus-unused-apps-cleanup")
+        if not helper.is_file():
+            helper = Path(__file__).resolve().parents[1] / "worker/setup/apps.sh"
+        if not helper.is_file():
+            raise RuntimeError("Unused Apple app cleanup helper missing")
+        environment = os.environ.copy()
+        environment["WORKER_CHECK_ONLY"] = "0" if apply else "1"
+        log(f"$ bash {helper} ({'apply' if apply else 'check'})")
+        subprocess.run(["bash", str(helper)], env=environment, check=True)
+
+    def spotlight_exclusions():
+        helper = Path(__file__).with_name("morpheus-spotlight-exclusions")
+        if not helper.is_file():
+            helper = Path(__file__).resolve().parents[1] / "worker/setup/spotlight.sh"
+        if not helper.is_file():
+            raise RuntimeError("Spotlight exclusion helper missing")
+        code_root_file = HOME / ".config/morpheus-factory/code-root"
+        code_root = code_root_file.read_text().strip() if code_root_file.is_file() else str(HOME / "code")
+        environment = os.environ.copy()
+        environment["WORKER_CHECK_ONLY"] = "0" if apply else "1"
+        environment["WORKER_CODE_ROOT"] = code_root
+        log(f"$ bash {helper} ({'apply' if apply else 'check'})")
+        subprocess.run(["bash", str(helper)], env=environment, check=True)
+
+    def derived_data(days, label):
+        # A running build or open Xcode may be writing inside DerivedData.
+        if swift_build_is_running() or xcode_editor_is_running():
+            log("Swift or Xcode active; skipping DerivedData")
         else:
             count = remove_old_children(
-                HOME / "Library/Developer/Xcode/DerivedData", args.build_days, apply
+                HOME / "Library/Developer/Xcode/DerivedData", days, apply, target
             )
-            log(f"Old DerivedData directories: {count}")
+            log(f"{label} DerivedData directories: {count}")
 
     def npx():
         if subprocess.run(["pgrep", "-f", "[n]px"], stdout=subprocess.DEVNULL).returncode == 0:
@@ -469,8 +515,9 @@ def main():
     stages = [
         ("Trash", trash),
         ("installers", installers),
+        ("unused Apple apps", unused_apple_apps),
         ("simulators", simulators),
-        ("DerivedData", derived_data),
+        ("DerivedData", lambda: derived_data(args.build_days, "Old")),
         ("npx", npx),
         ("SwiftPM", lambda: prune_large_swiftpm_cache(
             HOME / "Library/Caches/org.swift.swiftpm", 5, apply)),
@@ -485,8 +532,12 @@ def main():
         ("agent application caches", agent_app_caches),
         ("worktrees", worktrees),
     ])
-    if args.watch:
-        stages.append(("Spotlight", lambda: reset_large_spotlight_index(True)))
+    if pressure:
+        stages.extend([
+            ("Spotlight exclusions", spotlight_exclusions),
+            ("Spotlight", lambda: reset_large_spotlight_index(apply)),
+            ("recent DerivedData", lambda: derived_data(1, "Fallback")),
+        ])
 
     lock_dir = HOME / ".local/state/morpheus-factory"
     lock_dir.mkdir(parents=True, exist_ok=True)
@@ -502,10 +553,11 @@ def main():
         for failure in failures:
             log("ERROR " + failure)
         return 1
-    if args.watch and not healthy_watch:
-        available, _ = space_gib()
-        log(f"Storage watchdog finished: {available:.1f} GiB free")
-        if available < floor:
+    ending_free, _ = space_gib()
+    log(f"Cleanup result: {ending_free:.1f} GiB free "
+        f"({ending_free - available:+.1f} GiB during this run)")
+    if apply and pressure:
+        if ending_free < floor:
             log("ERROR Free space remains below the reserve after eligible cleanup")
             return 2
     log("Cleanup complete")

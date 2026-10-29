@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import time
 import unittest
@@ -18,8 +19,9 @@ spec.loader.exec_module(cleanup)
 
 class SimulatorOwnershipTests(unittest.TestCase):
     def test_watchdog_reserve_scales_with_disk_and_stops_at_target(self):
-        self.assertEqual(cleanup.watch_limits(460), (50, 80))
-        self.assertEqual(cleanup.watch_limits(931), (94, 124))
+        self.assertEqual(cleanup.watch_limits(460), (69, 99))
+        self.assertEqual(cleanup.watch_limits(931), (140, 170))
+        self.assertEqual(cleanup.watch_limits(931, min_free_percent=10), (94, 124))
         calls = []
         free = iter([40, 90])
         stages = [("first", lambda: calls.append("first")),
@@ -37,6 +39,32 @@ class SimulatorOwnershipTests(unittest.TestCase):
             self.assertEqual([name for name, _ in stages.call_args.args[0]], ["Trash"])
             self.assertIsNone(stages.call_args.args[1])
 
+    def test_one_terabyte_worker_enters_pressure_cleanup_at_100_gib(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(cleanup, "HOME", Path(directory)), \
+             patch.object(cleanup.sys, "argv", ["cleanup", "--watch"]), \
+             patch.object(cleanup, "space_gib", return_value=(100, 931)), \
+             patch.object(cleanup, "execute_stages", return_value=[]) as stages:
+            self.assertEqual(cleanup.main(), 2)
+            labels = [name for name, _ in stages.call_args.args[0]]
+            self.assertIn("unused Apple apps", labels)
+            self.assertIn("Spotlight exclusions", labels)
+            self.assertIn("Spotlight", labels)
+            self.assertEqual(labels[-1], "recent DerivedData")
+            self.assertEqual(stages.call_args.args[1], 170)
+
+    def test_manual_cleanup_includes_apps_and_pressure_only_spotlight(self):
+        for free, spotlight in ((100, True), (200, False)):
+            with self.subTest(free=free), tempfile.TemporaryDirectory() as directory, \
+                 patch.object(cleanup, "HOME", Path(directory)), \
+                 patch.object(cleanup.sys, "argv", ["cleanup", "--apply"]), \
+                 patch.object(cleanup, "space_gib", return_value=(free, 931)), \
+                 patch.object(cleanup, "execute_stages", return_value=[]) as stages:
+                self.assertEqual(cleanup.main(), 2 if spotlight else 0)
+                labels = [name for name, _ in stages.call_args.args[0]]
+                self.assertIn("unused Apple apps", labels)
+                self.assertEqual("Spotlight" in labels, spotlight)
+
     def test_low_reserve_runs_to_target_and_reports_remaining_pressure(self):
         for ending_space, expected_exit in [(81, 0), (45, 2)]:
             with self.subTest(ending_space=ending_space), tempfile.TemporaryDirectory() as directory, \
@@ -45,31 +73,66 @@ class SimulatorOwnershipTests(unittest.TestCase):
                  patch.object(cleanup, "space_gib", side_effect=[(40, 460), (ending_space, 460)]), \
                  patch.object(cleanup, "execute_stages", return_value=[]) as stages:
                 self.assertEqual(cleanup.main(), expected_exit)
-                self.assertEqual(stages.call_args.args[1], 80)
+                self.assertEqual(stages.call_args.args[1], 99)
 
-    def test_installer_cleanup_limits_scope_and_age(self):
+    def test_installed_app_installers_need_no_age_but_unrelated_archives_remain(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             downloads = root / "Downloads"
             apps = root / "Applications"
             downloads.mkdir()
             (apps / "Claude.app").mkdir(parents=True)
+            (apps / "Xcode-beta.app").mkdir()
+            (apps / "Brave Browser.app").mkdir()
             old_xcode = downloads / "Xcode_27.xip"
             old_claude = downloads / "Claude.dmg"
+            new_xcode = downloads / "Xcode_28_Beta.xip"
+            brave = downloads / "Brave-Browser-1.0.dmg"
             unrelated = downloads / "important.zip"
-            new_xcode = downloads / "Xcode_28.xip"
-            for path in (old_xcode, old_claude, unrelated, new_xcode):
+            not_installed = downloads / "UnknownApp.pkg"
+            for path in (old_xcode, old_claude, new_xcode, brave, unrelated, not_installed):
                 path.write_bytes(b"installer")
             age = time.time() - 40 * cleanup.DAY
             for path in (old_xcode, old_claude, unrelated):
                 os.utime(path, (age, age))
-            self.assertEqual(cleanup.remove_old_installers(downloads, 30, False, apps), 2)
+            self.assertEqual(cleanup.remove_installed_app_installers(downloads, False, apps), 4)
             self.assertTrue(old_xcode.exists())
-            self.assertEqual(cleanup.remove_old_installers(downloads, 30, True, apps), 2)
+            self.assertEqual(cleanup.remove_installed_app_installers(downloads, True, apps), 4)
             self.assertFalse(old_xcode.exists())
             self.assertFalse(old_claude.exists())
+            self.assertFalse(new_xcode.exists())
+            self.assertFalse(brave.exists())
             self.assertTrue(unrelated.exists())
-            self.assertTrue(new_xcode.exists())
+            self.assertTrue(not_installed.exists())
+
+    def test_old_build_directories_stop_at_target_without_touching_recent_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            oldest = root / "oldest"
+            older = root / "older"
+            third = root / "third"
+            recent = root / "recent"
+            for path in (oldest, older, third, recent):
+                path.mkdir()
+                (path / "build").write_bytes(b"output")
+            now = time.time()
+            os.utime(oldest, (now - 10 * cleanup.DAY,) * 2)
+            os.utime(older, (now - 8 * cleanup.DAY,) * 2)
+            os.utime(third, (now - 7.5 * cleanup.DAY,) * 2)
+            with patch.object(cleanup, "space_gib", side_effect=[(40, 460), (70, 460), (105, 460)]):
+                self.assertEqual(cleanup.remove_old_children(root, 7, True, target=100), 2)
+            self.assertFalse(oldest.exists())
+            self.assertFalse(older.exists())
+            self.assertTrue(third.exists())
+            self.assertTrue(recent.exists())
+
+    def test_simulator_window_does_not_count_as_xcode_editor(self):
+        simulator = "/Applications/Xcode.app/Contents/Developer/Applications/Simulator.app/Contents/MacOS/Simulator\n"
+        editor = "/Applications/Xcode.app/Contents/MacOS/Xcode\n"
+        with patch.object(cleanup.subprocess, "check_output", return_value=simulator):
+            self.assertFalse(cleanup.xcode_editor_is_running())
+        with patch.object(cleanup.subprocess, "check_output", return_value=editor):
+            self.assertTrue(cleanup.xcode_editor_is_running())
 
     def test_trash_removes_only_entries_older_than_30_days(self):
         from types import SimpleNamespace
@@ -191,6 +254,21 @@ class SimulatorOwnershipTests(unittest.TestCase):
                 self.assertEqual(cleanup.remove_app_cache_contents(root, ("Cache",), ("Claude",), True), 1)
             self.assertFalse((cache / "data").exists())
             self.assertEqual((session / "state").read_bytes(), b"session")
+
+    def test_spotlight_helper_runs_without_launchd_tmpdir(self):
+        helper = source.parents[1] / "worker/setup/spotlight.sh"
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            code = home / "code"
+            code.mkdir()
+            environment = os.environ.copy()
+            environment.pop("TMPDIR", None)
+            environment.update({"HOME": str(home), "WORKER_CODE_ROOT": str(code),
+                                "WORKER_CHECK_ONLY": "1"})
+            result = subprocess.run(["bash", str(helper)], env=environment,
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((code / ".metadata_never_index").exists())
 
     def test_worker_lease_protects_device_until_expiry(self):
         udid = "11111111-2222-3333-4444-555555555555"
