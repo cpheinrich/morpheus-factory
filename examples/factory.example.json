@@ -1,0 +1,69 @@
+{
+  "broker": {
+    "kind": "sub2api",
+    "baseUrl": "https://factory-broker.internal",
+    "timeoutMs": 5000
+  },
+  "degradedMode": "native",
+  "policy": {
+    "stopAtPercent": 90,
+    "requireKnownQuota": true
+  },
+  "hosts": [
+    {
+      "id": "studio",
+      "transport": "ssh",
+      "target": "studio.local",
+      "workspaces": ["/Users/chrisheinrich/code"],
+      "nativeLogin": true,
+      "healthy": true
+    },
+    {
+      "id": "mini",
+      "transport": "ssh",
+      "target": "mini.local",
+      "workspaces": ["/Users/zoe/code"],
+      "nativeLogin": false,
+      "healthy": true
+    },
+    {
+      "id": "mbp",
+      "transport": "ssh",
+      "target": "mbp.local",
+      "workspaces": ["/Users/chrisheinrich/code"],
+      "nativeLogin": false,
+      "healthy": true
+    }
+  ],
+  "profiles": [
+    {
+      "id": "claude-max",
+      "provider": "claude",
+      "group": "claude",
+      "model": "claude-sonnet-5",
+      "effort": "high",
+      "permission": "acceptEdits",
+      "brokerUser": "worker-claude-max",
+      "keyRef": "env:MORPHEUS_FACTORY_KEY_CLAUDE_MAX"
+    },
+    {
+      "id": "codex-pro",
+      "provider": "codex",
+      "group": "codex",
+      "model": "gpt-6.1-codex",
+      "effort": "high",
+      "permission": "workspace-write",
+      "brokerUser": "worker-codex-pro",
+      "keyRef": "secret:factory/codex-pro",
+      "hosts": ["studio", "mini"]
+    },
+    {
+      "id": "grok-fast",
+      "provider": "grok",
+      "group": "grok",
+      "model": "grok-5",
+      "permission": "read-only",
+      "brokerUser": "worker-grok-fast"
+    }
+  ]
+}

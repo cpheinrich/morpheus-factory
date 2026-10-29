@@ -1,0 +1,5 @@
+# Build scripts are opt-in. esbuild needs its postinstall: vitest and tsx both
+# run through it. Anything that does not need one stays false rather than
+# unanswered, because an unanswered entry fails `pnpm install` outright.
+allowBuilds:
+  esbuild: true
