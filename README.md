@@ -55,9 +55,10 @@ pnpm factory plan --task MO-26-10-28-00.00.00 --profile claude-max --config exam
 ```
 
 Deliberately **not** here yet: SSH execution, provider process management,
-streaming, session resume, Paperclip API calls. Those exist and are qualified in
-`cpheinrich/morpheus` (`scripts/pool-runner.mjs`, `pool-remote.mjs`). Rewriting
-them here would duplicate the one part that is already proven.
+streaming, session resume, Paperclip API calls. The factory contract keeps that
+execution work in Morpheus. As of 2026-10-29, Morpheus main does not contain
+the `pool-runner.mjs` and `pool-remote.mjs` entry points described by the
+original design, so fleet activation remains a separate integration step.
 
 ## The two decisions in code
 
@@ -122,3 +123,14 @@ groups, and should live with the operator, not in the repo.
 
 v0. Placement, admission, the broker port, configuration validation and the
 degraded path are implemented and tested. Execution still lives in Morpheus.
+
+## Mac worker preparation
+
+Run `bash worker/setup.sh` from a clone on a new Mac. Its
+[setup stages](worker/README.md) remove unused Apple apps, install local tool prerequisites, build factory,
+check out Morpheus, exclude development roots from Spotlight, and install the
+[hourly storage watchdog](docs/development-cache.md), including 30-day Trash retention,
+guarded old-worktree cleanup and a 5 GiB SwiftPM cache threshold. Use `--check` to inspect
+the host without changing it. This is the first stage of the single-command
+worker setup: fleet activation still needs broker configuration, provider CLIs
+and the Morpheus execution adapter.
