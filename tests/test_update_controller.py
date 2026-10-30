@@ -111,7 +111,8 @@ class UpdateControllerTests(unittest.TestCase):
         ci = {"image": "ci-xcode-27.2", "label": "xcode-27.2", "repository": "darwin-health/evo",
               "tart": "/usr/bin/true", "builder": "/usr/bin/true", "verifier": "/usr/bin/false", "activator": "/usr/bin/printf"}
         identity = {"disk.img": {"inode": 1}}
-        with patch.object(controller, "stage"), patch.object(controller, "image_is_sealed", return_value=True), \
+        with patch.object(controller, "stage") as stage, patch.object(controller, "matching_app", return_value=Path("/Applications/Xcode_27.2.app")), \
+             patch.object(controller, "image_is_sealed", return_value=True), \
              patch.object(controller, "image_identity", side_effect=lambda image: identity.copy()), \
              patch.object(controller, "run", return_value="") as run:
             self.assertEqual(controller.stage_ci_image("27.2", "27B52", state, None, [], ci), "verified-and-activated")
@@ -120,6 +121,7 @@ class UpdateControllerTests(unittest.TestCase):
             self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
             run.reset_mock()
             self.assertEqual(controller.stage_ci_image("27.2", "27B52", state, None, [], ci), "already-verified")
+            stage.assert_not_called()
             self.assertFalse(any(call.args[0][0] == ci["verifier"] for call in run.call_args_list))
             identity["disk.img"] = {"inode": 2}
             run.reset_mock()

@@ -146,7 +146,10 @@ def ci_environment():
 
 
 def stage_ci_image(version, build, stage_root, verification, components, ci):
-    stage(version, build, stage_root, verification, components)
+    # The fleet sequencer stages missing host apps before this command. Keep
+    # ordinary hourly image checks cheap when the exact app is already present.
+    if matching_app(version, build) is None:
+        stage(version, build, stage_root, verification, components)
     image = ci["image"]
     if not image_is_sealed(ci["tart"], image):
         run([ci["builder"], "--xcode", str(app_path(version)), "--name", image], env=ci_environment(), capture=False, timeout=14400)
