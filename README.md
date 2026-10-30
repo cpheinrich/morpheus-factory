@@ -139,8 +139,9 @@ and the Morpheus execution adapter.
 
 ## Host updates
 
-[`docs/host-updates.md`](docs/host-updates.md) describes the first update
-reconciler. It pins exact Xcode version and build per host, stages the approved
-app beside the current one, and requires a reviewed `promote` phase plus a
-passing build before changing `xcode-select`. An optional hourly LaunchAgent
-fast-forwards a clean Factory checkout and reconciles its reviewed manifest.
+[`docs/host-updates.md`](docs/host-updates.md) describes the per-host Xcode
+reconciler. It pins exact version and build, stages the approved app beside the
+current one, and validates before changing `xcode-select`. The
+[`fleet controller`](fleet/README.md) carries a reviewed pin through the Tart
+image, Evo CI, and host promotion. The hourly LaunchAgent fast-forwards a clean
+Factory checkout before reconciling the reviewed manifest.

@@ -136,11 +136,23 @@ def image_is_sealed(tart, image):
     return any(item.get("Name") == image and item.get("Source") == "local" and not item.get("Running") for item in images)
 
 
+def ci_environment():
+    # Image tools may fetch GitHub runner assets, but never need Apple login or
+    # verification-code credentials inherited from the host staging process.
+    allowed = ("HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "USER", "LOGNAME",
+               "GH_TOKEN", "FACTORY_GH_TOKEN", "GIT_ASKPASS", "GIT_TERMINAL_PROMPT",
+               "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0")
+    return {key: os.environ[key] for key in allowed if key in os.environ}
+
+
 def stage_ci_image(version, build, stage_root, verification, components, ci):
-    stage(version, build, stage_root, verification, components)
+    # The fleet sequencer stages missing host apps before this command. Keep
+    # ordinary hourly image checks cheap when the exact app is already present.
+    if matching_app(version, build) is None:
+        stage(version, build, stage_root, verification, components)
     image = ci["image"]
     if not image_is_sealed(ci["tart"], image):
-        run([ci["builder"], "--xcode", str(app_path(version)), "--name", image], capture=False, timeout=14400)
+        run([ci["builder"], "--xcode", str(app_path(version)), "--name", image], env=ci_environment(), capture=False, timeout=14400)
     if not image_is_sealed(ci["tart"], image):
         raise UpdateError("CI image builder did not produce a sealed local image")
     identity = image_identity(image)
@@ -151,7 +163,7 @@ def stage_ci_image(version, build, stage_root, verification, components, ci):
     except (OSError, ValueError):
         cached = False
     if not cached:
-        run([ci["verifier"], "--name", image, "--version", version, "--build", build], capture=False, timeout=900)
+        run([ci["verifier"], "--name", image, "--version", version, "--build", build], env=ci_environment(), capture=False, timeout=900)
         if image_identity(image) != identity:
             raise UpdateError("CI image changed during verification")
         receipt.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -159,7 +171,7 @@ def stage_ci_image(version, build, stage_root, verification, components, ci):
         temporary.write_text(json.dumps(expected, sort_keys=True) + "\n")
         os.chmod(temporary, 0o600)
         temporary.replace(receipt)
-    run([ci["activator"], "--repo", ci["repository"], "--label", ci["label"], "--image", image], capture=False, timeout=180)
+    run([ci["activator"], "--repo", ci["repository"], "--label", ci["label"], "--image", image], env=ci_environment(), capture=False, timeout=180)
     return "already-verified" if cached else "verified-and-activated"
 
 
