@@ -69,8 +69,12 @@ python3 worker/install_updates.py --host zoe-mac-mini --credentials-project /Use
 ```
 
 It fetches and fast-forwards Factory main only when the checkout is clean and
-on `main`, then invokes `reconcile` through the Evo credentials wrapper. No
-secret appears in its plist. It logs to
+on `main`, then invokes the [fleet coordinator](../fleet/README.md) through a
+GitHub-only credential wrapper. The coordinator stages the host through the
+specified host credentials project, verifies and activates the exact CI image,
+waits for reviewed Evo and promotion merges, and only then calls host
+`reconcile` through that same credentials project. No secret appears in its
+plist. It logs to
 `~/Library/Logs/morpheus-factory/host-updates.log` and repeats hourly. A pin
 change on protected main is therefore picked up by the next successful tick.
 The URL and executable path are not secrets and are passed by the installer;

@@ -28,4 +28,10 @@ GIT_TERMINAL_PROMPT=0 git -C "$root" -c credential.helper= fetch origin main
 git -C "$root" merge --ff-only origin/main
 [[ -f "$manifest" ]] || { echo "manifest is missing" >&2; exit 78; }
 cd "$credentials_project"
-exec morpheus credentials run -- python3 "$root/worker/update_controller.py" reconcile --host "$host" --manifest "$manifest"
+# Fleet is the sole sequencer: it stages the host and image, waits for the
+# reviewed consumer/promotion merges, then invokes host reconcile. The wrapper
+# gives its PR agent GitHub auth without exposing the Apple credentials used
+# only by the host-action children.
+exec python3 "$root/fleet/with_github.py" --user cpheinrich -- \
+  python3 "$root/fleet/controller.py" reconcile --host "$host" \
+  --factory-root "$root" --credentials-project "$credentials_project"
