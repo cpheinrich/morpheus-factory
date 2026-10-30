@@ -440,9 +440,9 @@ def reconcile(version, build, checks, phase, stage_root, verification=None, comp
     stage(version, build, stage_root, verification, components)
     if phase == "stage":
         return "staged"
-    validate(version, build, checks)
     if before["selectedMatches"]:
         return "already-current"
+    validate(version, build, checks)
     previous = before["selected"]
     try:
         activate(version, build)

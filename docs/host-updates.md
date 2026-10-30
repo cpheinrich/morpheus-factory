@@ -63,14 +63,20 @@ Factory main checkout:
 
 ```sh
 python3 worker/install_updates.py --check --host zoe-mac-mini --credentials-project /Users/zoe/code/evo \
+  --github-user cpheinrich \
   --provider-command /absolute/path/to/code-provider --provider-url https://broker.tailnet.ts.net
 python3 worker/install_updates.py --host zoe-mac-mini --credentials-project /Users/zoe/code/evo \
+  --github-user cpheinrich \
   --provider-command /absolute/path/to/code-provider --provider-url https://broker.tailnet.ts.net
 ```
 
 It fetches and fast-forwards Factory main only when the checkout is clean and
-on `main`, then invokes `reconcile` through the Evo credentials wrapper. No
-secret appears in its plist. It logs to
+on `main`, then invokes the [fleet coordinator](../fleet/README.md) through a
+GitHub-only credential wrapper. The coordinator stages the host through the
+specified host credentials project, verifies and activates the exact CI image,
+waits for reviewed Evo and promotion merges, and only then calls host
+`reconcile` through that same credentials project. No secret appears in its
+plist; the selected GitHub account login is a nonsecret installer option. It logs to
 `~/Library/Logs/morpheus-factory/host-updates.log` and repeats hourly. A pin
 change on protected main is therefore picked up by the next successful tick.
 The URL and executable path are not secrets and are passed by the installer;
@@ -103,11 +109,14 @@ guest verification. Other repositories retain their current image and cache.
 The consumer workflow still moves by reviewed PR, and the host pin moves to
 `promote` only after the consumer's CI run passes.
 
-The reviewed manifest now pins 27.2 build 27B52 in `stage` phase and declares
+The reviewed manifest pins 27.2 build 27B52 in `promote` phase and declares
 `MetalToolchain`, which Evo's iOS build needs. The reconciler asks Xcode to
 download each declared component even when the app is already installed, so a
-component interrupted by an outage is retried. The current 26.6 selection
-remains unchanged while staging and validation are completed.
-Build and test the corresponding CI image before changing the phase to `promote`.
-The `reconcile` command is safe to repeat. The fleet coordinator connects the
-image, consumer workflow and host pin changes before declaring convergence.
+component interrupted by an outage is retried. Promotion validates a detached
+worktree at freshly fetched Evo `origin/main`, leaving Zoe's dirty task checkout
+untouched. It then switches `xcode-select` and restores the prior selection if
+verification fails.
+Once the approved version is selected, hourly reconciles repair components but
+skip the full Evo rebuild. The `reconcile` command is safe to repeat. The fleet
+coordinator connects host image readiness, consumer PR/CI evidence and the
+reviewed phase change before declaring convergence.

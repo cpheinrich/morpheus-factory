@@ -95,6 +95,17 @@ class UpdateControllerTests(unittest.TestCase):
         self.assertEqual(result, "promoted")
         self.assertEqual(calls, ["stage", "validate", "activate"])
 
+    def test_already_selected_pin_does_not_rebuild_each_hour(self):
+        with patch.object(controller, "report", return_value={"selectedMatches": True}), \
+             patch.object(controller, "stage") as stage, \
+             patch.object(controller, "validate") as validate, \
+             patch.object(controller, "activate") as activate:
+            result = controller.reconcile("27.2", "27B52", [], "promote", Path("/tmp/state"))
+        self.assertEqual(result, "already-current")
+        stage.assert_called_once()
+        validate.assert_not_called()
+        activate.assert_not_called()
+
     def test_failed_validation_does_not_switch(self):
         with patch.object(controller, "report", return_value={"selected": "/Applications/Xcode.app/Contents/Developer", "selectedMatches": False}), \
              patch.object(controller, "stage"), \
@@ -103,6 +114,23 @@ class UpdateControllerTests(unittest.TestCase):
             with self.assertRaises(controller.UpdateError):
                 controller.reconcile("27.2", "27B52", [], "promote", Path("/tmp/state"))
         activate.assert_not_called()
+
+    def test_failed_post_switch_verification_restores_previous_selection(self):
+        previous = "/Applications/Xcode.app/Contents/Developer"
+        selected = "/Applications/Xcode_27.2.app/Contents/Developer"
+        def command(argv, **kwargs):
+            if argv == ["/usr/bin/xcode-select", "-p"]:
+                return selected
+            if argv == ["/usr/bin/sudo", "-n", "/usr/bin/xcode-select", "--switch", previous]:
+                return ""
+            raise AssertionError(argv)
+        with patch.object(controller, "report", return_value={"selected": previous, "selectedMatches": False}), \
+             patch.object(controller, "stage"), patch.object(controller, "validate"), \
+             patch.object(controller, "activate", side_effect=controller.UpdateError("post-switch check failed")), \
+             patch.object(controller, "run", side_effect=command) as run:
+            with self.assertRaisesRegex(controller.UpdateError, "post-switch check failed"):
+                controller.reconcile("27.2", "27B52", [], "promote", Path("/tmp/state"))
+        run.assert_any_call(["/usr/bin/sudo", "-n", "/usr/bin/xcode-select", "--switch", previous])
 
     def test_ci_image_requires_exact_guest_proof_and_caches_only_unchanged_image(self):
         temporary = tempfile.TemporaryDirectory()

@@ -6,7 +6,7 @@
         "version": "27.2",
         "build": "27B52",
         "components": ["MetalToolchain"],
-        "phase": "stage"
+        "phase": "promote"
       },
       "verification": {
         "purpose": "apple-developer",
@@ -22,8 +22,7 @@
       },
       "validation": [
         {
-          "argv": ["/Users/zoe/code/evo/apps/ios/scripts/dev.sh", "build"],
-          "cwd": "/Users/zoe/code/evo/apps/ios"
+          "argv": ["/usr/bin/python3", "/Users/zoe/code/morpheus-factory/worker/validate_evo_main.py", "--repo", "/Users/zoe/code/evo"]
         }
       ]
     }
