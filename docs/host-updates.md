@@ -89,12 +89,12 @@ simulator runtime; the validation command must cover the consumer's actual
 build destination. The Tart image and consumer workflow pins still require a
 separate coordinated rollout using `agent-host-setup/ci-vm/build-image.sh`.
 
-The reviewed manifest now pins 27.2 build 27B52 in `stage` phase and declares
+The reviewed manifest pins 27.2 build 27B52 in `promote` phase and declares
 `MetalToolchain`, which Evo's iOS build needs. The reconciler asks Xcode to
 download each declared component even when the app is already installed, so a
-component interrupted by an outage is retried. The current 26.6 selection
-remains unchanged while staging and validation are completed.
-Build and test the corresponding CI image before changing the phase to `promote`.
-The `reconcile` command is safe to repeat. A future fleet-level
+component interrupted by an outage is retried. Promotion validates Evo before
+switching `xcode-select` and restores the prior selection if verification fails.
+Once the approved version is selected, hourly reconciles repair components but
+skip the full Evo rebuild. The `reconcile` command is safe to repeat. A future fleet-level
 controller must connect these per-host state transitions to the Tart image and
 consumer workflow pin changes before declaring the fleet converged.

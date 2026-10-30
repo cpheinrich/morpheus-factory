@@ -6,7 +6,7 @@
         "version": "27.2",
         "build": "27B52",
         "components": ["MetalToolchain"],
-        "phase": "stage"
+        "phase": "promote"
       },
       "verification": {
         "purpose": "apple-developer",
