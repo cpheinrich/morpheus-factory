@@ -9,21 +9,32 @@ import argparse
 import fcntl
 import json
 import os
+import pty
 import re
+import select
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
 VERSION = re.compile(r"^[0-9]+(?:\.[0-9]+){1,2}$")
 BUILD = re.compile(r"^[A-Za-z0-9]+$")
 HOST = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+CODE = re.compile(r"^[0-9]{4,10}$")
+SMS_PROMPT = re.compile(r"Enter the ([0-9]+) digit code sent to")
 
 
 class UpdateError(Exception):
     pass
+
+
+class CodeTimeout(UpdateError):
+    def __init__(self, message, started_at=None):
+        super().__init__(message)
+        self.started_at = started_at
 
 
 def run(argv, *, env=None, capture=True, cwd=None, timeout=None):
@@ -60,6 +71,11 @@ def pin_for_host(manifest_path, host):
         raise UpdateError("Xcode version must be exact numeric form")
     if not isinstance(build, str) or not BUILD.fullmatch(build):
         raise UpdateError("Xcode build must be an exact build identifier")
+    components = xcode.get("components", [])
+    if not isinstance(components, list) or any(not isinstance(item, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]+", item) for item in components):
+        raise UpdateError("Xcode components must be named identifiers")
+    if len(set(components)) != len(components):
+        raise UpdateError("Xcode components must not repeat")
     checks = pin.get("validation")
     if not isinstance(checks, list) or not checks:
         raise UpdateError(f"host {host} requires nonempty validation commands")
@@ -72,10 +88,16 @@ def pin_for_host(manifest_path, host):
             raise UpdateError("validation executable must be an absolute path")
         if "cwd" in check and (not isinstance(check["cwd"], str) or not Path(check["cwd"]).is_absolute()):
             raise UpdateError("validation cwd must be absolute")
-    phase = pin.get("phase", "stage")
+    phase = xcode.get("phase", "stage")
     if phase not in ("stage", "promote"):
         raise UpdateError("phase must be stage or promote")
-    return version, build, checks, phase
+    verification = pin.get("verification")
+    if verification is not None:
+        if not isinstance(verification, dict) or set(verification) != {"purpose", "account"}:
+            raise UpdateError("verification requires purpose and account")
+        if any(not isinstance(verification[key], str) or not HOST.fullmatch(verification[key]) for key in ("purpose", "account")):
+            raise UpdateError("verification purpose and account must be lowercase identifiers")
+    return version, build, checks, phase, verification, components
 
 
 def app_path(version):
@@ -126,10 +148,127 @@ def xcodes_environment():
     return child
 
 
-def check_authentication():
+def request_verification_code(verification, started_at, timeout_seconds, length):
+    """Ask a host-installed provider for one code without logging its output."""
+    executable = os.environ.get("FACTORY_VERIFICATION_CODE_COMMAND", "")
+    if not executable or not Path(executable).is_absolute() or not os.access(executable, os.X_OK):
+        raise UpdateError("verification-code provider is not configured as an executable absolute path")
+    env = {key: os.environ[key] for key in ("HOME", "PATH", "TMPDIR", "LANG", "USER", "LOGNAME", "FACTORY_VERIFICATION_CODE_URL", "FACTORY_VERIFICATION_CODE_TOKEN") if key in os.environ}
+    request = {"purpose": verification["purpose"], "account": verification["account"], "challengeStartedAt": started_at, "timeoutSeconds": timeout_seconds}
+    try:
+        result = subprocess.run([executable], input=json.dumps(request), text=True, capture_output=True, env=env, check=False, timeout=timeout_seconds + 10)
+    except subprocess.TimeoutExpired as error:
+        raise CodeTimeout("verification-code provider timed out") from error
+    if result.returncode == 75:
+        raise CodeTimeout("verification code did not arrive")
+    if result.returncode:
+        raise UpdateError("verification-code provider failed")
+    try:
+        response = json.loads(result.stdout)
+        code = response["code"]
+    except (ValueError, KeyError, TypeError) as error:
+        raise UpdateError("verification-code provider returned an invalid response") from error
+    if not isinstance(code, str) or not CODE.fullmatch(code) or len(code) != length:
+        raise UpdateError("verification-code provider returned an invalid code length")
+    return code
+
+
+def _xcodes_interactive_attempt(argv, verification, wait_seconds, first_challenge):
+    """Drive xcodes' one-shot SMS prompt through a private pseudo-terminal."""
+    master, slave = pty.openpty()
+    process = None
+    output = ""
+    sms_selected = False
+    phone_selected = False
+    code_submitted = False
+    challenge_started = first_challenge
+    try:
+        process = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave, env=xcodes_environment(), close_fds=True)
+        os.close(slave)
+        slave = -1
+        deadline = time.monotonic() + 4 * 60 * 60
+        while True:
+            if time.monotonic() >= deadline:
+                raise UpdateError("xcodes timed out")
+            ready, _, _ = select.select([master], [], [], min(1, max(0, deadline - time.monotonic())))
+            if ready:
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    output = (output + chunk.decode("utf-8", errors="replace"))[-131072:]
+                    recent = output[-8192:]
+                    if not sms_selected and 'Enter "sms"' in recent and "trusted devices:" in recent:
+                        os.write(master, b"sms\n")
+                        sms_selected = True
+                    if not phone_selected and "Select a trusted phone number to receive a code via SMS:" in recent:
+                        choices = re.findall(r"(?m)^([0-9]+): .+$", recent)
+                        configured = os.environ.get("FACTORY_VERIFICATION_PHONE_INDEX", "")
+                        if configured:
+                            if configured not in choices:
+                                raise UpdateError("configured trusted phone index is unavailable")
+                            choice = configured
+                        elif len(choices) == 1:
+                            choice = choices[0]
+                        else:
+                            raise UpdateError("multiple trusted phone numbers require FACTORY_VERIFICATION_PHONE_INDEX")
+                        challenge_started = challenge_started or time.time()
+                        os.write(master, f"{choice}\n".encode())
+                        phone_selected = True
+                    match = SMS_PROMPT.search(recent)
+                    if not code_submitted and match:
+                        challenge_started = challenge_started or time.time()
+                        try:
+                            code = request_verification_code(verification, challenge_started, wait_seconds, int(match.group(1)))
+                        except CodeTimeout as error:
+                            raise CodeTimeout(str(error), challenge_started) from error
+                        os.write(master, f"{code}\n".encode())
+                        code_submitted = True
+                    continue
+            if process.poll() is not None:
+                break
+        if process.returncode:
+            details = output.lower()
+            if any(word in details for word in ("rate limit", "too many", "locked")):
+                raise UpdateError("xcodes: Apple limited verification attempts")
+            if code_submitted:
+                raise UpdateError("xcodes: verification code was rejected")
+            raise UpdateError(f"xcodes exited {process.returncode}")
+        return "xcodes-complete", challenge_started
+    finally:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        os.close(master)
+        if slave >= 0:
+            os.close(slave)
+
+
+def run_xcodes(argv, verification=None):
+    if verification is None or not os.environ.get("FACTORY_VERIFICATION_CODE_COMMAND"):
+        return run(argv, env=xcodes_environment())
+    first_challenge = None
+    for attempt, seconds in enumerate((120, 120, 180), 1):
+        try:
+            output, _ = _xcodes_interactive_attempt(argv, verification, seconds, first_challenge)
+            return output.strip()
+        except CodeTimeout as error:
+            if attempt == 3:
+                raise UpdateError("verification-code-timeout after three SMS sends") from error
+            # A late code from the first send remains eligible after a resend.
+            first_challenge = first_challenge or error.started_at
+    raise AssertionError("unreachable")
+
+
+def check_authentication(verification=None):
     if shutil.which("xcodes") is None:
         raise UpdateError("xcodes is missing")
-    output = run(["xcodes", "list", "--data-source", "apple", "--no-color"], env=xcodes_environment(), timeout=60)
+    output = run_xcodes(["xcodes", "list", "--data-source", "apple", "--no-color"], verification)
     if not output:
         raise UpdateError("Apple Developer login returned no Xcode listings")
     return "apple-authenticated"
@@ -146,9 +285,18 @@ def interactive_login():
     return "apple-authenticated"
 
 
-def stage(version, build, stage_root):
+def ensure_components(app, components):
+    child = {key: os.environ[key] for key in ("HOME", "PATH", "TMPDIR", "LANG", "USER", "LOGNAME") if key in os.environ}
+    child["DEVELOPER_DIR"] = str(app / "Contents/Developer")
+    for component in components:
+        run([str(app / "Contents/Developer/usr/bin/xcodebuild"), "-downloadComponent", component], env=child, capture=False, timeout=7200)
+
+
+def stage(version, build, stage_root, verification=None, components=()):
     app = app_path(version)
-    if matching_app(version, build) is not None:
+    existing = matching_app(version, build)
+    if existing is not None:
+        ensure_components(existing, components)
         return "already-installed"
     have = installed_build(app)
     if have is not None or app.exists():
@@ -162,7 +310,7 @@ def stage(version, build, stage_root):
         directory = Path(temporary)
         # xcodes handles Apple's login and download. The archive is then expanded
         # by macOS xip, which verifies its signature, before the app is moved.
-        run(["xcodes", "download", version, "--directory", str(directory)], env=xcodes_environment())
+        run_xcodes(["xcodes", "download", version, "--directory", str(directory)], verification)
         archives = list(directory.glob("*.xip"))
         if len(archives) != 1:
             raise UpdateError("expected exactly one Xcode archive from xcodes")
@@ -179,6 +327,7 @@ def stage(version, build, stage_root):
         raise UpdateError("installed Xcode did not retain the approved identity")
     run(["/usr/bin/sudo", "-n", str(app / "Contents/Developer/usr/bin/xcodebuild"), "-license", "accept"])
     run(["/usr/bin/sudo", "-n", str(app / "Contents/Developer/usr/bin/xcodebuild"), "-runFirstLaunch"], capture=False)
+    ensure_components(app, components)
     return "staged"
 
 
@@ -211,9 +360,9 @@ def validate(version, build, checks):
     return "validated"
 
 
-def reconcile(version, build, checks, phase, stage_root):
+def reconcile(version, build, checks, phase, stage_root, verification=None, components=()):
     before = report(version, build)
-    stage(version, build, stage_root)
+    stage(version, build, stage_root, verification, components)
     if phase == "stage":
         return "staged"
     validate(version, build, checks)
@@ -238,7 +387,12 @@ def main():
     parser.add_argument("--state-dir", default=str(Path.home() / ".local/state/morpheus-factory/updates"))
     args = parser.parse_args()
     if args.command == "auth-check":
-        print(json.dumps({"result": check_authentication()}))
+        verification = None
+        if args.manifest or args.host:
+            if not args.manifest or not args.host or not HOST.fullmatch(args.host):
+                raise UpdateError("auth-check requires both --manifest and --host when either is supplied")
+            verification = pin_for_host(args.manifest, args.host)[4]
+        print(json.dumps({"result": check_authentication(verification)}))
         return 0
     if args.command == "auth-login":
         print(json.dumps({"result": interactive_login()}))
@@ -247,7 +401,7 @@ def main():
         raise UpdateError("host id must use lowercase letters, digits, and hyphens")
     if not args.manifest:
         raise UpdateError("--manifest is required")
-    version, build, checks, phase = pin_for_host(args.manifest, args.host)
+    version, build, checks, phase, verification, components = pin_for_host(args.manifest, args.host)
     if args.command == "status":
         print(json.dumps(report(version, build), indent=2))
         return 0
@@ -259,11 +413,11 @@ def main():
         except BlockingIOError as error:
             raise UpdateError("another update is in progress") from error
         if args.command == "stage":
-            result = stage(version, build, state_dir)
+            result = stage(version, build, state_dir, verification, components)
         elif args.command == "validate":
             result = validate(version, build, checks)
         elif args.command == "reconcile":
-            result = reconcile(version, build, checks, phase, state_dir)
+            result = reconcile(version, build, checks, phase, state_dir, verification, components)
         else:
             result = activate(version, build)
         print(json.dumps({"result": result, "host": args.host, "xcode": {"version": version, "build": build}}))

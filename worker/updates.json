@@ -3,9 +3,14 @@
   "hosts": {
     "zoe-mac-mini": {
       "xcode": {
-        "version": "26.6",
-        "build": "17F113",
+        "version": "27.2",
+        "build": "27B52",
+        "components": ["MetalToolchain"],
         "phase": "stage"
+      },
+      "verification": {
+        "purpose": "apple-developer",
+        "account": "zoe-apple-developer"
       },
       "validation": [
         {
