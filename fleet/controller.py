@@ -104,9 +104,11 @@ def host_status(factory: Path, manifest: Path, host: str) -> dict:
 def host_action(factory: Path, evo: Path, manifest: Path, host: str, action: str) -> None:
     if action not in ("stage", "image-stage", "reconcile"):
         raise FleetError("invalid host action")
-    # The credentials companion injects Apple login only into this child. The
-    # GitHub token used by the fleet PR agent is excluded from that child.
-    excluded = ("GH_TOKEN", "FACTORY_GH_TOKEN", "GIT_ASKPASS", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0")
+    # The credentials companion injects Apple login only into this child.
+    # Image staging also needs GitHub auth to fetch CI runner/action packages;
+    # the worker scopes its own builder/verifier/activator children separately.
+    excluded = () if action == "image-stage" else (
+        "GH_TOKEN", "FACTORY_GH_TOKEN", "GIT_ASKPASS", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0")
     env = {key: value for key, value in os.environ.items() if key not in excluded}
     command(["morpheus", "credentials", "run", "--", sys.executable,
              str(factory / "worker/update_controller.py"), action,

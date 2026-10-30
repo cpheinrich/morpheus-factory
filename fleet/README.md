@@ -33,8 +33,10 @@ host out as pending rather than claiming every Evo lane has converged.
 
 The GitHub wrapper retrieves the selected account's existing `gh` credential
 without printing it, builds a temporary Git askpass helper, and passes only
-GitHub auth plus ordinary process variables to the fleet task. Apple credentials
-and SMS provider tokens are never inherited by the PR agent. `codex exec`
+GitHub auth plus ordinary process variables to the fleet task. The image
+builder receives GitHub auth to fetch runner assets; worker child environments
+exclude Apple login and SMS provider values. Apple credentials and SMS tokens
+are never inherited by the PR agent. `codex exec`
 uses its existing local login and automatic approval review under the workspace
 sandbox; it does not need an OpenAI API key in this LaunchAgent.
 

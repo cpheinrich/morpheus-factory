@@ -100,8 +100,10 @@ class FleetControllerTests(unittest.TestCase):
     def test_host_action_does_not_inherit_github_token(self):
         with patch.dict(os.environ, {"GH_TOKEN": "secret", "FACTORY_GH_TOKEN": "secret"}), patch.object(controller, "command") as command:
             controller.host_action(Path("/factory"), Path("/evo"), Path("/factory/worker/updates.json"), "zoe-mac-mini", "stage")
-        self.assertNotIn("GH_TOKEN", command.call_args.kwargs["env"])
-        self.assertNotIn("FACTORY_GH_TOKEN", command.call_args.kwargs["env"])
+            self.assertNotIn("GH_TOKEN", command.call_args.kwargs["env"])
+            self.assertNotIn("FACTORY_GH_TOKEN", command.call_args.kwargs["env"])
+            controller.host_action(Path("/factory"), Path("/evo"), Path("/factory/worker/updates.json"), "zoe-mac-mini", "image-stage")
+            self.assertEqual(command.call_args.kwargs["env"]["GH_TOKEN"], "secret")
 
     def test_dirty_host_tools_block_image_stage(self):
         with patch.object(controller, "command", side_effect=["main", " M ci-vm/build-image.sh"]):
