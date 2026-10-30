@@ -2,7 +2,7 @@
 # Scheduled entry point. Fetches only protected main, then reconciles its pin.
 set -euo pipefail
 
-host="" manifest="" credentials_project="" github_user="" provider_command="" provider_url=""
+host="" manifest="" credentials_project="" github_user="cpheinrich" provider_command="" provider_url=""
 while (($#)); do
   case "$1" in
     --host) host="$2"; shift 2 ;;

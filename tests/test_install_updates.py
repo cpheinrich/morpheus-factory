@@ -1,5 +1,6 @@
 import importlib.util
 import plistlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -42,6 +43,30 @@ class InstallUpdatesTests(unittest.TestCase):
             self.assertEqual(bootstrap_attempts, 3)
             self.assertEqual(sleep.call_count, 2)
             self.assertTrue(any(command[:2] == ["plutil", "-lint"] for command in commands))
+
+    def test_invalid_plist_does_not_replace_installed_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            project = home / "host-credentials"
+            project.mkdir()
+            target = home / "Library/LaunchAgents/com.morpheus-factory.host-updates.plist"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"old installed plist")
+            commands = []
+
+            def command(argv, **kwargs):
+                commands.append(argv)
+                if argv[:2] == ["plutil", "-lint"]:
+                    raise subprocess.CalledProcessError(1, argv)
+                return SimpleNamespace(returncode=0)
+
+            argv = ["install_updates.py", "--host", "zoe-mac-mini", "--credentials-project", str(project)]
+            with patch.object(sys, "argv", argv), patch.object(installer.Path, "home", return_value=home), \
+                 patch.object(installer.subprocess, "run", side_effect=command):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    installer.main()
+            self.assertEqual(target.read_bytes(), b"old installed plist")
+            self.assertFalse(any(args[:2] == ["launchctl", "bootout"] for args in commands))
 
 
 if __name__ == "__main__":

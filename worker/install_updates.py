@@ -57,8 +57,8 @@ def main():
     temporary = target.with_suffix(".tmp")
     temporary.write_bytes(plistlib.dumps(document))
     os.chmod(temporary, 0o600)
+    subprocess.run(["plutil", "-lint", str(temporary)], check=True, capture_output=True)
     temporary.replace(target)
-    subprocess.run(["plutil", "-lint", str(target)], check=True, capture_output=True)
     domain = f"gui/{os.getuid()}"
     subprocess.run(["launchctl", "bootout", f"{domain}/{document['Label']}"], check=False, capture_output=True)
     for attempt in range(5):
