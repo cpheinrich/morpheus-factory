@@ -136,3 +136,11 @@ Use `--check` to inspect
 the host without changing it. This is the first stage of the single-command
 worker setup: fleet activation still needs broker configuration, provider CLIs
 and the Morpheus execution adapter.
+
+## Host updates
+
+[`docs/host-updates.md`](docs/host-updates.md) describes the first update
+reconciler. It pins exact Xcode version and build per host, stages the approved
+app beside the current one, and requires a reviewed `promote` phase plus a
+passing build before changing `xcode-select`. An optional hourly LaunchAgent
+fast-forwards a clean Factory checkout and reconciles its reviewed manifest.
