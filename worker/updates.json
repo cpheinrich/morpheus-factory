@@ -22,8 +22,7 @@
       },
       "validation": [
         {
-          "argv": ["/Users/zoe/code/evo/apps/ios/scripts/dev.sh", "build"],
-          "cwd": "/Users/zoe/code/evo/apps/ios"
+          "argv": ["/usr/bin/python3", "/Users/zoe/code/morpheus-factory/worker/validate_evo_main.py", "--repo", "/Users/zoe/code/evo"]
         }
       ]
     }

@@ -112,8 +112,10 @@ The consumer workflow still moves by reviewed PR, and the host pin moves to
 The reviewed manifest pins 27.2 build 27B52 in `promote` phase and declares
 `MetalToolchain`, which Evo's iOS build needs. The reconciler asks Xcode to
 download each declared component even when the app is already installed, so a
-component interrupted by an outage is retried. Promotion validates Evo before
-switching `xcode-select` and restores the prior selection if verification fails.
+component interrupted by an outage is retried. Promotion validates a detached
+worktree at freshly fetched Evo `origin/main`, leaving Zoe's dirty task checkout
+untouched. It then switches `xcode-select` and restores the prior selection if
+verification fails.
 Once the approved version is selected, hourly reconciles repair components but
 skip the full Evo rebuild. The `reconcile` command is safe to repeat. The fleet
 coordinator connects host image readiness, consumer PR/CI evidence and the
