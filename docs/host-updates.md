@@ -87,7 +87,21 @@ security assessment. It refuses to switch while `xcodebuild` or
 previous selected developer directory. An Xcode update can require a new
 simulator runtime; the validation command must cover the consumer's actual
 build destination. The Tart image and consumer workflow pins still require a
-separate coordinated rollout using `agent-host-setup/ci-vm/build-image.sh`.
+coordinated rollout; `image-stage` prepares the host image and pool before the
+consumer PR runs.
+
+The optional `ci` block supplies a host-local image builder, verifier, pool
+activator, repository, image and runner label. The fleet coordinator calls
+`python3 worker/update_controller.py image-stage --host <host> --manifest worker/updates.json`
+before opening consumer pin PRs. It stages the exact app, builds a missing Tart
+image, boots a disposable clone to verify its exact Xcode version and build,
+then activates that repository's version-specific image pool. A 0600 receipt in
+`~/.local/state/morpheus-factory/updates/ci-images/` binds this proof to the
+Tart image's disk/config/NVRAM file identities; ordinary reconciles use the
+receipt and a cheap sealed-image check. Replacement or mutation forces a new
+guest verification. Other repositories retain their current image and cache.
+The consumer workflow still moves by reviewed PR, and the host pin moves to
+`promote` only after the consumer's CI run passes.
 
 The reviewed manifest now pins 27.2 build 27B52 in `stage` phase and declares
 `MetalToolchain`, which Evo's iOS build needs. The reconciler asks Xcode to
@@ -95,6 +109,5 @@ download each declared component even when the app is already installed, so a
 component interrupted by an outage is retried. The current 26.6 selection
 remains unchanged while staging and validation are completed.
 Build and test the corresponding CI image before changing the phase to `promote`.
-The `reconcile` command is safe to repeat. A future fleet-level
-controller must connect these per-host state transitions to the Tart image and
-consumer workflow pin changes before declaring the fleet converged.
+The `reconcile` command is safe to repeat. The fleet coordinator connects the
+image, consumer workflow and host pin changes before declaring convergence.

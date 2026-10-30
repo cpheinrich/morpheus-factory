@@ -104,6 +104,28 @@ class UpdateControllerTests(unittest.TestCase):
                 controller.reconcile("27.2", "27B52", [], "promote", Path("/tmp/state"))
         activate.assert_not_called()
 
+    def test_ci_image_requires_exact_guest_proof_and_caches_only_unchanged_image(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        state = Path(temporary.name)
+        ci = {"image": "ci-xcode-27.2", "label": "xcode-27.2", "repository": "darwin-health/evo",
+              "tart": "/usr/bin/true", "builder": "/usr/bin/true", "verifier": "/usr/bin/false", "activator": "/usr/bin/printf"}
+        identity = {"disk.img": {"inode": 1}}
+        with patch.object(controller, "stage"), patch.object(controller, "image_is_sealed", return_value=True), \
+             patch.object(controller, "image_identity", side_effect=lambda image: identity.copy()), \
+             patch.object(controller, "run", return_value="") as run:
+            self.assertEqual(controller.stage_ci_image("27.2", "27B52", state, None, [], ci), "verified-and-activated")
+            self.assertTrue(any(call.args[0][0] == ci["verifier"] for call in run.call_args_list))
+            receipt = state / "ci-images/ci-xcode-27.2.json"
+            self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+            run.reset_mock()
+            self.assertEqual(controller.stage_ci_image("27.2", "27B52", state, None, [], ci), "already-verified")
+            self.assertFalse(any(call.args[0][0] == ci["verifier"] for call in run.call_args_list))
+            identity["disk.img"] = {"inode": 2}
+            run.reset_mock()
+            self.assertEqual(controller.stage_ci_image("27.2", "27B52", state, None, [], ci), "verified-and-activated")
+            self.assertTrue(any(call.args[0][0] == ci["verifier"] for call in run.call_args_list))
+
     def test_provider_receives_scoped_environment_and_no_code_is_logged(self):
         class Result:
             returncode = 0
