@@ -23,6 +23,8 @@ Paperclip API calls live in `cpheinrich/morpheus`. Do not reimplement them here.
 | `src/plan.ts` | Placement → capacity → spec |
 | `src/brokers/` | The swap seam: `port.ts`, `http.ts`, `native.ts` |
 | `src/cli.ts` | `plan`, `profiles`, `hosts` |
+| `worker/` | Per-host Xcode update controller and hourly runner |
+| `fleet/` | Cross-repo Xcode pin coordinator and scoped GitHub auth |
 | `tests/` | Vitest, mirroring `src/` |
 | `docs/design.md` | Decisions, risks, open questions |
 
