@@ -126,6 +126,20 @@ class UpdateControllerTests(unittest.TestCase):
             self.assertEqual(controller.stage_ci_image("27.2", "27B52", state, None, [], ci), "verified-and-activated")
             self.assertTrue(any(call.args[0][0] == ci["verifier"] for call in run.call_args_list))
 
+    def test_ci_tools_receive_github_auth_without_apple_or_sms_secrets(self):
+        with patch.dict(os.environ, {
+            "GH_TOKEN": "github-secret",
+            "FACTORY_GH_TOKEN": "github-secret",
+            "GIT_ASKPASS": "/tmp/askpass",
+            "ZOE_APPLE_ID_PASSWORD": "apple-secret",
+            "FACTORY_VERIFICATION_CODE_TOKEN": "sms-secret",
+        }):
+            passed = controller.ci_environment()
+        self.assertEqual(passed["GH_TOKEN"], "github-secret")
+        self.assertEqual(passed["GIT_ASKPASS"], "/tmp/askpass")
+        self.assertNotIn("ZOE_APPLE_ID_PASSWORD", passed)
+        self.assertNotIn("FACTORY_VERIFICATION_CODE_TOKEN", passed)
+
     def test_provider_receives_scoped_environment_and_no_code_is_logged(self):
         class Result:
             returncode = 0
