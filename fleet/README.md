@@ -20,7 +20,7 @@ For each exact `version`/`build` pin, reconciliation proceeds in order:
    `promote` manifest PR, if needed. Only then call the host reconciler to
    validate with `DEVELOPER_DIR`, switch `xcode-select`, and roll back a failed
    switch. An accidentally early `promote` phase cannot bypass the image/CI gate.
-5. Report convergence only after the host selects the approved build. The
+5. Report host convergence only after that host selects the approved build. The
    image and pool checks repeat on subsequent ticks, using the host-side
    verified receipt for a cheap unchanged-image check.
 

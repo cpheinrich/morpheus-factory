@@ -83,14 +83,23 @@ def evo_has_pin(evo: Path, pin: Pin) -> bool:
             return False
         if f"xcode-{pin.version}" not in body:
             return False
+        if path.endswith(("ios-full-verification.yml", "ios-nightly-build.yml", "ios-production-release.yml")) and "prepare-pinned-xcode-tests.sh" not in body:
+            return False
         if path.endswith(("ios-nightly-build.yml", "ios-production-release.yml")) and "assert-xcode-build.sh --require-final" not in body:
             return False
     try:
         assertion = git_file(evo, "origin/main", "apps/ios/scripts/ci/assert-xcode-build.sh")
-        prep = git_file(evo, "origin/main", "apps/ios/scripts/ci/prepare-tests.sh")
+        pinned = git_file(evo, "origin/main", "apps/ios/scripts/ci/prepare-pinned-xcode-tests.sh")
+        unit = git_file(evo, "origin/main", "apps/ios/scripts/ci/prepare-unit-tests.sh")
+        shared = git_file(evo, "origin/main", "apps/ios/scripts/ci/prepare-tests.sh")
+        cd_v2 = git_file(evo, "origin/main", ".github/workflows/cd-v2-delivery.yml")
     except FleetError:
         return False
-    return f"Xcode {pin.version}" in assertion and f"Build version {pin.build}" in assertion and "assert-xcode-build.sh" in prep
+    return (f"Xcode {pin.version}" in assertion and f"Build version {pin.build}" in assertion
+            and 'assert-xcode-build.sh" --require-final' in pinned
+            and 'assert-xcode-build.sh" --require-final' in unit
+            and "assert-xcode-build.sh" not in shared
+            and "pre-test-script: apps/ios/scripts/ci/prepare-tests.sh" in cd_v2)
 
 
 def host_status(factory: Path, manifest: Path, host: str) -> dict:
@@ -222,7 +231,7 @@ def reconcile(factory: Path, evo: Path, host_setup: Path, manifest: Path, host: 
     status = host_status(factory, manifest, host)
     if not status["selectedMatches"]:
         return "waiting-host-promotion"
-    return "converged"
+    return "host-converged"
 
 
 def main() -> int:

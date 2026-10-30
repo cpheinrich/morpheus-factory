@@ -23,9 +23,12 @@ class FleetControllerTests(unittest.TestCase):
 
     def test_consumer_must_have_merged_workflow_and_build_pins(self):
         pin = controller.Pin("27.2", "27B52", "stage")
-        files = {path: "runner: xcode-27.2\n" + "xcode-version: '27.2'\n" * count + ("assert-xcode-build.sh --require-final\n" if path.endswith(("ios-nightly-build.yml", "ios-production-release.yml")) else "") for path, count in controller.EVO_WORKFLOWS.items()}
+        files = {path: "runner: xcode-27.2\n" + "xcode-version: '27.2'\n" * count + ("prepare-pinned-xcode-tests.sh\n" if path.endswith(("ios-full-verification.yml", "ios-nightly-build.yml", "ios-production-release.yml")) else "") + ("assert-xcode-build.sh --require-final\n" if path.endswith(("ios-nightly-build.yml", "ios-production-release.yml")) else "") for path, count in controller.EVO_WORKFLOWS.items()}
         files["apps/ios/scripts/ci/assert-xcode-build.sh"] = "Xcode 27.2\nBuild version 27B52"
-        files["apps/ios/scripts/ci/prepare-tests.sh"] = "assert-xcode-build.sh"
+        files["apps/ios/scripts/ci/prepare-pinned-xcode-tests.sh"] = 'bash "$script_directory/assert-xcode-build.sh" --require-final'
+        files["apps/ios/scripts/ci/prepare-unit-tests.sh"] = 'bash "$script_directory/assert-xcode-build.sh" --require-final'
+        files["apps/ios/scripts/ci/prepare-tests.sh"] = "shared test preparation"
+        files[".github/workflows/cd-v2-delivery.yml"] = "pre-test-script: apps/ios/scripts/ci/prepare-tests.sh"
         with patch.object(controller, "command") as command, patch.object(controller, "git_file", side_effect=lambda repo, ref, path: files[path]):
             self.assertTrue(controller.evo_has_pin(Path("/evo"), pin))
             self.assertEqual(command.call_args.args[0], ["git", "-C", "/evo", "fetch", "origin", "main"])
@@ -93,7 +96,7 @@ class FleetControllerTests(unittest.TestCase):
                  patch.object(controller, "host_action", side_effect=lambda factory, evo, manifest, host, action: actions.append(action)), \
                  patch.object(controller, "evo_has_pin", return_value=True), \
                  patch.object(controller, "run_agent") as agent:
-                self.assertEqual(controller.reconcile(root, root, root, manifest, "zoe-mac-mini", root), "converged")
+                self.assertEqual(controller.reconcile(root, root, root, manifest, "zoe-mac-mini", root), "host-converged")
                 agent.assert_not_called()
             self.assertEqual(actions, ["image-stage", "reconcile"])
 
