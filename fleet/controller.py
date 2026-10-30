@@ -149,6 +149,7 @@ def agent_prompt(step: str, pin: Pin, factory: Path, evo: Path, host_setup: Path
         f"Factory: {factory}; Evo: {evo}; agent-host-setup: {host_setup}. "
         "Read each repository's AGENTS.md. Work in isolated branches/worktrees, never push protected main. "
         "Keep secrets and SMS codes out of files, arguments, output, and PRs. "
+        "Christopher authorized unattended Xcode updates, PR creation and merging after review/CI; temporary CI interruption during migration is acceptable. "
         "Finish focused tests, independent review when required, CI and merge under normal repository rules. "
         "Do not relax exact version/build checks. Be idempotent: continue an existing pin PR instead of opening a duplicate. "
     )
