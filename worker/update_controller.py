@@ -135,6 +135,17 @@ def check_authentication():
     return "apple-authenticated"
 
 
+def interactive_login():
+    if shutil.which("xcodes") is None:
+        raise UpdateError("xcodes is missing")
+    # Only this explicit command inherits the user's terminal for Apple's 2FA.
+    # It still passes only the Apple variables to the installer.
+    result = subprocess.run(["xcodes", "list", "--data-source", "apple", "--no-color"], env=xcodes_environment(), check=False)
+    if result.returncode:
+        raise UpdateError("authentication-required: interactive Apple login did not complete")
+    return "apple-authenticated"
+
+
 def stage(version, build, stage_root):
     app = app_path(version)
     if matching_app(version, build) is not None:
@@ -221,13 +232,16 @@ def reconcile(version, build, checks, phase, stage_root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("auth-check", "status", "stage", "validate", "activate", "reconcile"))
+    parser.add_argument("command", choices=("auth-check", "auth-login", "status", "stage", "validate", "activate", "reconcile"))
     parser.add_argument("--manifest")
     parser.add_argument("--host")
     parser.add_argument("--state-dir", default=str(Path.home() / ".local/state/morpheus-factory/updates"))
     args = parser.parse_args()
     if args.command == "auth-check":
         print(json.dumps({"result": check_authentication()}))
+        return 0
+    if args.command == "auth-login":
+        print(json.dumps({"result": interactive_login()}))
         return 0
     if not args.host or not HOST.fullmatch(args.host):
         raise UpdateError("host id must use lowercase letters, digits, and hyphens")

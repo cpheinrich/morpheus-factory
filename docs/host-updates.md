@@ -28,6 +28,10 @@ allowlisted environment. `xcodes` may still require a two-factor code; this
 headless controller then reports `authentication-required` and retains the
 current Xcode. The Apple Account is not an App Store Connect API key. Never put
 the password or verification code in the manifest, a command argument, or logs.
+For the first Apple two-factor challenge, Zoe can run `auth-login` instead of
+`auth-check` in her own terminal. It passes only the Apple values to `xcodes`
+and lets her enter the code directly into Apple's prompt. Do not run
+`auth-login` from launchd.
 
 After merging a reviewed manifest, install the hourly reconciler from the
 Factory main checkout:

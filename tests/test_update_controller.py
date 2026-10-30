@@ -52,6 +52,16 @@ class UpdateControllerTests(unittest.TestCase):
         self.assertNotIn("ZOE_APPLE_ID_PASSWORD", passed)
         self.assertNotIn("ASC_ISSUER_ID", passed)
 
+    def test_interactive_login_keeps_other_credentials_out_of_xcodes(self):
+        class Result:
+            returncode = 0
+
+        with patch.dict(os.environ, {"ZOE_APPLE_ID": "user@example.test", "ZOE_APPLE_ID_PASSWORD": "secret", "ASC_ISSUER_ID": "other-secret"}), \
+             patch.object(controller.shutil, "which", return_value="/opt/homebrew/bin/xcodes"), \
+             patch.object(controller.subprocess, "run", return_value=Result()) as child:
+            self.assertEqual(controller.interactive_login(), "apple-authenticated")
+        self.assertNotIn("ASC_ISSUER_ID", child.call_args.kwargs["env"])
+
     def test_stage_phase_never_validates_or_switches(self):
         with patch.object(controller, "report", return_value={"selected": "/Applications/Xcode.app/Contents/Developer"}), \
              patch.object(controller, "stage", return_value="staged") as stage, \
