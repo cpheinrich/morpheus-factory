@@ -7,6 +7,7 @@ Apple credentials; logs and the persisted state never contain them.
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import pty
@@ -98,6 +99,80 @@ def pin_for_host(manifest_path, host):
         if any(not isinstance(verification[key], str) or not HOST.fullmatch(verification[key]) for key in ("purpose", "account")):
             raise UpdateError("verification purpose and account must be lowercase identifiers")
     return version, build, checks, phase, verification, components
+
+
+def ci_for_host(manifest_path, host, version):
+    pin = json.loads(Path(manifest_path).read_text())["hosts"][host]
+    ci = pin.get("ci")
+    if not isinstance(ci, dict):
+        raise UpdateError(f"host {host} has no CI image configuration")
+    if ci.get("image") != f"ci-xcode-{version}" or ci.get("label") != f"xcode-{version}":
+        raise UpdateError("CI image and label must match the approved Xcode version")
+    if not isinstance(ci.get("repository"), str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", ci["repository"]):
+        raise UpdateError("CI repository must be an owner/name pair")
+    for key in ("builder", "verifier", "activator"):
+        path = ci.get(key)
+        if not isinstance(path, str) or not Path(path).is_absolute() or not os.access(path, os.X_OK):
+            raise UpdateError(f"CI {key} must be an executable absolute path")
+    tart = ci.get("tart", str(Path.home() / ".local/bin/tart"))
+    if not isinstance(tart, str) or not Path(tart).is_absolute() or not os.access(tart, os.X_OK):
+        raise UpdateError("CI tart must be an executable absolute path")
+    return {**ci, "tart": tart}
+
+
+def image_identity(image):
+    root = Path.home() / ".tart/vms" / image
+    files = {}
+    for name in ("disk.img", "config.json", "nvram.bin"):
+        path = root / name
+        stat = path.stat()
+        files[name] = {"inode": stat.st_ino, "size": stat.st_size, "ctimeNs": stat.st_ctime_ns, "mtimeNs": stat.st_mtime_ns}
+    files["configSha256"] = hashlib.sha256((root / "config.json").read_bytes()).hexdigest()
+    return files
+
+
+def image_is_sealed(tart, image):
+    images = json.loads(run([tart, "list", "--format", "json"]))
+    return any(item.get("Name") == image and item.get("Source") == "local" and not item.get("Running") for item in images)
+
+
+def ci_environment():
+    # Image tools may fetch GitHub runner assets, but never need Apple login or
+    # verification-code credentials inherited from the host staging process.
+    allowed = ("HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "USER", "LOGNAME",
+               "GH_TOKEN", "FACTORY_GH_TOKEN", "GIT_ASKPASS", "GIT_TERMINAL_PROMPT",
+               "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0")
+    return {key: os.environ[key] for key in allowed if key in os.environ}
+
+
+def stage_ci_image(version, build, stage_root, verification, components, ci):
+    # The fleet sequencer stages missing host apps before this command. Keep
+    # ordinary hourly image checks cheap when the exact app is already present.
+    if matching_app(version, build) is None:
+        stage(version, build, stage_root, verification, components)
+    image = ci["image"]
+    if not image_is_sealed(ci["tart"], image):
+        run([ci["builder"], "--xcode", str(app_path(version)), "--name", image], env=ci_environment(), capture=False, timeout=14400)
+    if not image_is_sealed(ci["tart"], image):
+        raise UpdateError("CI image builder did not produce a sealed local image")
+    identity = image_identity(image)
+    receipt = stage_root / "ci-images" / f"{image}.json"
+    expected = {"image": image, "version": version, "build": build, "files": identity}
+    try:
+        cached = json.loads(receipt.read_text()) == expected
+    except (OSError, ValueError):
+        cached = False
+    if not cached:
+        run([ci["verifier"], "--name", image, "--version", version, "--build", build], env=ci_environment(), capture=False, timeout=900)
+        if image_identity(image) != identity:
+            raise UpdateError("CI image changed during verification")
+        receipt.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        temporary = receipt.with_suffix(".tmp")
+        temporary.write_text(json.dumps(expected, sort_keys=True) + "\n")
+        os.chmod(temporary, 0o600)
+        temporary.replace(receipt)
+    run([ci["activator"], "--repo", ci["repository"], "--label", ci["label"], "--image", image], env=ci_environment(), capture=False, timeout=180)
+    return "already-verified" if cached else "verified-and-activated"
 
 
 def app_path(version):
@@ -381,7 +456,7 @@ def reconcile(version, build, checks, phase, stage_root, verification=None, comp
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("auth-check", "auth-login", "status", "stage", "validate", "activate", "reconcile"))
+    parser.add_argument("command", choices=("auth-check", "auth-login", "status", "stage", "validate", "activate", "reconcile", "image-stage"))
     parser.add_argument("--manifest")
     parser.add_argument("--host")
     parser.add_argument("--state-dir", default=str(Path.home() / ".local/state/morpheus-factory/updates"))
@@ -412,7 +487,10 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise UpdateError("another update is in progress") from error
-        if args.command == "stage":
+        if args.command == "image-stage":
+            ci = ci_for_host(args.manifest, args.host, version)
+            result = stage_ci_image(version, build, state_dir, verification, components, ci)
+        elif args.command == "stage":
             result = stage(version, build, state_dir, verification, components)
         elif args.command == "validate":
             result = validate(version, build, checks)

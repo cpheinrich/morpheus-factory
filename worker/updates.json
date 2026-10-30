@@ -12,6 +12,14 @@
         "purpose": "apple-developer",
         "account": "zoe-apple-developer"
       },
+      "ci": {
+        "repository": "darwin-health/evo",
+        "image": "ci-xcode-27.2",
+        "label": "xcode-27.2",
+        "builder": "/Users/zoe/code/agent-host-setup/ci-vm/build-image.sh",
+        "verifier": "/Users/zoe/code/agent-host-setup/ci-vm/verify-image.sh",
+        "activator": "/Users/zoe/code/agent-host-setup/ci-vm/activate-pool.mjs"
+      },
       "validation": [
         {
           "argv": ["/Users/zoe/code/evo/apps/ios/scripts/dev.sh", "build"],
