@@ -2,18 +2,19 @@
 # Scheduled entry point. Fetches only protected main, then reconciles its pin.
 set -euo pipefail
 
-host="" manifest="" credentials_project="" provider_command="" provider_url=""
+host="" manifest="" credentials_project="" github_user="" provider_command="" provider_url=""
 while (($#)); do
   case "$1" in
     --host) host="$2"; shift 2 ;;
     --manifest) manifest="$2"; shift 2 ;;
     --credentials-project) credentials_project="$2"; shift 2 ;;
+    --github-user) github_user="$2"; shift 2 ;;
     --provider-command) provider_command="$2"; shift 2 ;;
     --provider-url) provider_url="$2"; shift 2 ;;
     *) echo "unknown argument" >&2; exit 2 ;;
   esac
 done
-[[ -n "$host" && -n "$manifest" && -n "$credentials_project" ]] || { echo "missing update runner input" >&2; exit 2; }
+[[ -n "$host" && -n "$manifest" && -n "$credentials_project" && "$github_user" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || { echo "missing or invalid update runner input" >&2; exit 2; }
 [[ -z "$provider_command" && -z "$provider_url" || -n "$provider_command" && -n "$provider_url" ]] || { echo "provider command and URL must be supplied together" >&2; exit 2; }
 if [[ -n "$provider_command" ]]; then
   [[ "$provider_command" == /* && -x "$provider_command" && "$provider_url" == https://* ]] || { echo "invalid verification provider configuration" >&2; exit 78; }
@@ -32,6 +33,6 @@ cd "$credentials_project"
 # reviewed consumer/promotion merges, then invokes host reconcile. The wrapper
 # gives its PR agent GitHub auth without exposing the Apple credentials used
 # only by the host-action children.
-exec python3 "$root/fleet/with_github.py" --user cpheinrich -- \
+exec python3 "$root/fleet/with_github.py" --user "$github_user" -- \
   python3 "$root/fleet/controller.py" reconcile --host "$host" \
   --factory-root "$root" --credentials-project "$credentials_project"

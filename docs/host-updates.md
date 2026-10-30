@@ -63,8 +63,10 @@ Factory main checkout:
 
 ```sh
 python3 worker/install_updates.py --check --host zoe-mac-mini --credentials-project /Users/zoe/code/evo \
+  --github-user cpheinrich \
   --provider-command /absolute/path/to/code-provider --provider-url https://broker.tailnet.ts.net
 python3 worker/install_updates.py --host zoe-mac-mini --credentials-project /Users/zoe/code/evo \
+  --github-user cpheinrich \
   --provider-command /absolute/path/to/code-provider --provider-url https://broker.tailnet.ts.net
 ```
 
@@ -74,7 +76,7 @@ GitHub-only credential wrapper. The coordinator stages the host through the
 specified host credentials project, verifies and activates the exact CI image,
 waits for reviewed Evo and promotion merges, and only then calls host
 `reconcile` through that same credentials project. No secret appears in its
-plist. It logs to
+plist; the selected GitHub account login is a nonsecret installer option. It logs to
 `~/Library/Logs/morpheus-factory/host-updates.log` and repeats hourly. A pin
 change on protected main is therefore picked up by the next successful tick.
 The URL and executable path are not secrets and are passed by the installer;
