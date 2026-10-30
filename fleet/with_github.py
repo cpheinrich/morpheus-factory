@@ -29,7 +29,7 @@ def main() -> int:
         askpass = Path(directory) / "askpass.sh"
         askpass.write_text('#!/bin/sh\ncase "$1" in *Username*) printf "%s\\n" x-access-token;; *Password*) printf "%s\\n" "$FACTORY_GH_TOKEN";; esac\n')
         askpass.chmod(0o700)
-        allowed = ("HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "USER", "LOGNAME", "SHELL", "TERM", "CODEX_HOME", "GH_CONFIG_DIR", "SSH_AUTH_SOCK")
+        allowed = ("HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "USER", "LOGNAME", "SHELL", "TERM", "CODEX_HOME", "GH_CONFIG_DIR")
         env = {key: os.environ[key] for key in allowed if key in os.environ}
         env.update(GH_TOKEN=token, FACTORY_GH_TOKEN=token,
                    GIT_ASKPASS=str(askpass), GIT_TERMINAL_PROMPT="0",

@@ -146,7 +146,7 @@ class FleetControllerTests(unittest.TestCase):
             seen.append((argv, kwargs))
             return Result()
         with patch.object(sys, "argv", ["with_github.py", "--user", "cpheinrich", "--", "python3", "fleet/controller.py"]), \
-             patch.dict(os.environ, {"ZOE_APPLE_ID_PASSWORD": "must-not-pass", "FACTORY_VERIFICATION_CODE_TOKEN": "must-not-pass"}), \
+             patch.dict(os.environ, {"ZOE_APPLE_ID_PASSWORD": "must-not-pass", "FACTORY_VERIFICATION_CODE_TOKEN": "must-not-pass", "SSH_AUTH_SOCK": "/private/sensitive.sock"}), \
              patch.object(with_github.subprocess, "run", side_effect=fake_run):
             self.assertEqual(with_github.main(), 0)
         self.assertEqual(seen[0][0], ["gh", "auth", "token", "-u", "cpheinrich"])
@@ -154,6 +154,7 @@ class FleetControllerTests(unittest.TestCase):
         self.assertEqual(child_env["GH_TOKEN"], "example-token")
         self.assertNotIn("ZOE_APPLE_ID_PASSWORD", child_env)
         self.assertNotIn("FACTORY_VERIFICATION_CODE_TOKEN", child_env)
+        self.assertNotIn("SSH_AUTH_SOCK", child_env)
 
 
 if __name__ == "__main__":
