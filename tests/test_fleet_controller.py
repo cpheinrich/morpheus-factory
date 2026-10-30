@@ -102,11 +102,22 @@ class FleetControllerTests(unittest.TestCase):
 
     def test_host_action_does_not_inherit_github_token(self):
         with patch.dict(os.environ, {"GH_TOKEN": "secret", "FACTORY_GH_TOKEN": "secret"}), patch.object(controller, "command") as command:
-            controller.host_action(Path("/factory"), Path("/evo"), Path("/factory/worker/updates.json"), "zoe-mac-mini", "stage")
+            controller.host_action(Path("/factory"), Path("/host-credentials"), Path("/factory/worker/updates.json"), "zoe-mac-mini", "stage")
             self.assertNotIn("GH_TOKEN", command.call_args.kwargs["env"])
             self.assertNotIn("FACTORY_GH_TOKEN", command.call_args.kwargs["env"])
-            controller.host_action(Path("/factory"), Path("/evo"), Path("/factory/worker/updates.json"), "zoe-mac-mini", "image-stage")
+            self.assertEqual(command.call_args.kwargs["cwd"], Path("/host-credentials"))
+            controller.host_action(Path("/factory"), Path("/host-credentials"), Path("/factory/worker/updates.json"), "zoe-mac-mini", "image-stage")
             self.assertEqual(command.call_args.kwargs["env"]["GH_TOKEN"], "secret")
+
+    def test_reconcile_uses_host_credentials_project_not_consumer_checkout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manifest = root / "updates.json"
+            manifest.write_text(json.dumps({"schemaVersion": 1, "hosts": {"zoe-mac-mini": {"xcode": {"version": "27.2", "build": "27B52", "phase": "stage"}}}}))
+            with patch.object(controller, "host_status", return_value={"installedMatches": False, "selectedMatches": False}), \
+                 patch.object(controller, "host_action") as action:
+                controller.reconcile(root, root / "consumer", root, manifest, "zoe-mac-mini", root, root / "host-credentials")
+            self.assertEqual(action.call_args.args[1], root / "host-credentials")
 
     def test_dirty_host_tools_block_image_stage(self):
         with patch.object(controller, "command", side_effect=["main", " M ci-vm/build-image.sh"]):
@@ -146,7 +157,8 @@ class FleetControllerTests(unittest.TestCase):
             seen.append((argv, kwargs))
             return Result()
         with patch.object(sys, "argv", ["with_github.py", "--user", "cpheinrich", "--", "python3", "fleet/controller.py"]), \
-             patch.dict(os.environ, {"ZOE_APPLE_ID_PASSWORD": "must-not-pass", "FACTORY_VERIFICATION_CODE_TOKEN": "must-not-pass", "SSH_AUTH_SOCK": "/private/sensitive.sock"}), \
+             patch.dict(os.environ, {"ZOE_APPLE_ID_PASSWORD": "must-not-pass", "FACTORY_VERIFICATION_CODE_TOKEN": "must-not-pass", "SSH_AUTH_SOCK": "/private/sensitive.sock",
+                                     "FACTORY_VERIFICATION_CODE_COMMAND": "/path/to/provider", "FACTORY_VERIFICATION_CODE_URL": "https://broker.example"}), \
              patch.object(with_github.subprocess, "run", side_effect=fake_run):
             self.assertEqual(with_github.main(), 0)
         self.assertEqual(seen[0][0], ["gh", "auth", "token", "-u", "cpheinrich"])
@@ -155,6 +167,8 @@ class FleetControllerTests(unittest.TestCase):
         self.assertNotIn("ZOE_APPLE_ID_PASSWORD", child_env)
         self.assertNotIn("FACTORY_VERIFICATION_CODE_TOKEN", child_env)
         self.assertNotIn("SSH_AUTH_SOCK", child_env)
+        self.assertEqual(child_env["FACTORY_VERIFICATION_CODE_COMMAND"], "/path/to/provider")
+        self.assertEqual(child_env["FACTORY_VERIFICATION_CODE_URL"], "https://broker.example")
 
 
 if __name__ == "__main__":
