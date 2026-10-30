@@ -110,7 +110,7 @@ def host_status(factory: Path, manifest: Path, host: str) -> dict:
     return status
 
 
-def host_action(factory: Path, evo: Path, manifest: Path, host: str, action: str) -> None:
+def host_action(factory: Path, credentials_project: Path, manifest: Path, host: str, action: str) -> None:
     if action not in ("stage", "image-stage", "reconcile"):
         raise FleetError("invalid host action")
     # The credentials companion injects Apple login only into this child.
@@ -121,7 +121,7 @@ def host_action(factory: Path, evo: Path, manifest: Path, host: str, action: str
     env = {key: value for key, value in os.environ.items() if key not in excluded}
     command(["morpheus", "credentials", "run", "--", sys.executable,
              str(factory / "worker/update_controller.py"), action,
-             "--host", host, "--manifest", str(manifest)], cwd=evo, env=env,
+             "--host", host, "--manifest", str(manifest)], cwd=credentials_project, env=env,
             timeout=14400 if action in ("stage", "image-stage") else 7200)
 
 
@@ -206,20 +206,21 @@ def run_agent(step: str, pin: Pin, factory: Path, evo: Path, host_setup: Path, s
         raise FleetError(f"{step} agent did not complete; session retained for the next tick")
 
 
-def reconcile(factory: Path, evo: Path, host_setup: Path, manifest: Path, host: str, state_dir: Path) -> str:
+def reconcile(factory: Path, evo: Path, host_setup: Path, manifest: Path, host: str, state_dir: Path, credentials_project: Path | None = None) -> str:
     pin = read_pin(manifest, host)
     state_path = state_dir / "fleet.json"
     state = private_state(state_path, pin)
+    credentials_project = credentials_project or evo
     status = host_status(factory, manifest, host)
     if not status["installedMatches"]:
-        host_action(factory, evo, manifest, host, "stage")
+        host_action(factory, credentials_project, manifest, host, "stage")
         status = host_status(factory, manifest, host)
         if not status["installedMatches"]:
             return "waiting-host-stage"
     sync_host_tools(host_setup)
     # The host-side command verifies the exact guest build and activates the
     # repo-specific runner pool as one idempotent transaction.
-    host_action(factory, evo, manifest, host, "image-stage")
+    host_action(factory, credentials_project, manifest, host, "image-stage")
     if not evo_has_pin(evo, pin):
         run_agent("consumer", pin, factory, evo, host_setup, state, state_path)
         if not evo_has_pin(evo, pin):
@@ -227,7 +228,7 @@ def reconcile(factory: Path, evo: Path, host_setup: Path, manifest: Path, host: 
     if pin.phase != "promote":
         run_agent("promote", pin, factory, evo, host_setup, state, state_path)
         return "waiting-promotion-merge"
-    host_action(factory, evo, manifest, host, "reconcile")
+    host_action(factory, credentials_project, manifest, host, "reconcile")
     status = host_status(factory, manifest, host)
     if not status["selectedMatches"]:
         return "waiting-host-promotion"
@@ -240,6 +241,7 @@ def main() -> int:
     parser.add_argument("--host", required=True)
     parser.add_argument("--factory-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--evo-root", type=Path, default=Path.home() / "code/evo")
+    parser.add_argument("--credentials-project", type=Path, help="host-scoped Morpheus credentials project; defaults to Evo checkout")
     parser.add_argument("--host-setup-root", type=Path, default=Path.home() / "code/agent-host-setup")
     parser.add_argument("--state-dir", type=Path, default=Path.home() / ".local/state/morpheus-factory/fleet")
     args = parser.parse_args()
@@ -255,7 +257,8 @@ def main() -> int:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise FleetError("another fleet reconciliation is running") from error
-        result = reconcile(factory, args.evo_root.resolve(), args.host_setup_root.resolve(), manifest, args.host, args.state_dir)
+        result = reconcile(factory, args.evo_root.resolve(), args.host_setup_root.resolve(), manifest, args.host, args.state_dir,
+                           args.credentials_project.resolve() if args.credentials_project else None)
     print(json.dumps({"pin": pin.key, "result": result}, sort_keys=True))
     return 0
 
