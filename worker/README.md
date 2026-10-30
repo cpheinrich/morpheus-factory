@@ -20,3 +20,12 @@ This prepares the host locally. Fleet activation will need separate stages for
 the factory catalog, broker connectivity, provider CLIs and Morpheus's runner.
 Those stages should keep credentials out of this repository and should not
 start a worker unless their readiness checks pass.
+
+## Xcode version reconciliation
+
+The reviewed `worker/updates.json` pins the host's Xcode version and build.
+`worker/update_controller.py` reports drift, stages a side-by-side Xcode, and
+promotes it only after declared validation passes. `worker/install_updates.py`
+installs an hourly LaunchAgent after the checkout is on clean `main`. See
+[`docs/host-updates.md`](../docs/host-updates.md) for the phase and credential
+contract. This does not replace the separate CI VM image rollout.

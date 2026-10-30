@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "hosts": {
+    "zoe-mac-mini": {
+      "xcode": {
+        "version": "27.2",
+        "build": "27B52",
+        "components": ["MetalToolchain"],
+        "phase": "stage"
+      },
+      "verification": {
+        "purpose": "apple-developer",
+        "account": "zoe-apple-developer"
+      },
+      "validation": [
+        {
+          "argv": ["/Users/zoe/code/evo/apps/ios/scripts/dev.sh", "build"],
+          "cwd": "/Users/zoe/code/evo/apps/ios"
+        }
+      ]
+    }
+  }
+}
