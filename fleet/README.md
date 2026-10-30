@@ -39,6 +39,12 @@ exclude Apple login and SMS provider values. Apple credentials and SMS tokens
 are never inherited by the PR agent. `codex exec`
 uses its existing local login and automatic approval review under the workspace
 sandbox; it does not need an OpenAI API key in this LaunchAgent.
+Pass the existing installer option `--credentials-project <path>` to the fleet
+CLI so each host runs Apple staging through its own credentials companion.
+The Evo checkout remains the consumer pin source; it is the default credentials
+project only for the current Zoe host.
+The installer-provided verification provider path and HTTPS URL pass through
+the GitHub wrapper; its broker token stays in the host credentials companion.
 
 After the host runner integration is merged, check status with:
 
