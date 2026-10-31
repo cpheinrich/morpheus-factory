@@ -544,6 +544,10 @@ def interactive_login(apple=None):
 
 IDLE_WAIT_SECONDS = 2 * 60 * 60
 IDLE_POLL_SECONDS = 30
+# A component install leaves xcodebuild helpers alive for a moment after it
+# returns; a real job holds Runner.Worker far longer than this settle window.
+SETTLE_SECONDS = 60
+SETTLE_POLL_SECONDS = 2
 
 
 def wait_until_idle(timeout=IDLE_WAIT_SECONDS, poll=IDLE_POLL_SECONDS):
@@ -729,8 +733,9 @@ def reconcile(version, build, checks, phase, stage_root, verification=None, comp
     if before["selectedMatches"]:
         return "already-current"
     # Do not run a long validation build beside a live job only for activation
-    # to refuse afterwards; the next tick retries.
-    if host_is_busy():
+    # to refuse afterwards; the next tick retries. Helpers of the component
+    # step above may still be exiting, so settle briefly before deciding.
+    if not wait_until_idle(timeout=SETTLE_SECONDS, poll=SETTLE_POLL_SECONDS):
         return "deferred-busy"
     validate(version, build, checks)
     previous = before["selected"]
