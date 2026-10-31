@@ -41,6 +41,46 @@ fi
 '''
 
 
+# Excerpts of Evo main after darwin-health/evo#715: delivery's workflow values are all
+# templated and the one literal is v3.mjs's XCODE_VERSION constant.
+REAL_DELIVERY_WORKFLOW = '''# runner image are Chris's pin (`xcode-27.2`, final build 27B52; darwin-health/evo#705), not config:
+# one value, XCODE_VERSION in apps/ios/scripts/ci/delivery/v3.mjs, reaches every job through the plan.
+jobs:
+  smoke:
+    with:
+      xcode-version: ${{ steps.plan.outputs.xcode-version }}
+      runner: ${{ steps.plan.outputs.runner }}
+  full:
+    with:
+      # The version-isolated Xcode VM image for v3.mjs XCODE_VERSION (27.2, #705); its pre-test hook
+      # asserts build 27B52.
+      runner: ${{ needs.plan.outputs.runner }}
+      xcode-version: ${{ needs.plan.outputs.xcode-version }}
+  upload:
+    runs-on: ${{ needs.plan.outputs.runner }}
+    steps:
+      - uses: cpheinrich/morpheus/.github/actions/ios-testflight-upload@main
+        with:
+          xcode-version: ${{ needs.plan.outputs.xcode-version }}
+'''
+V3 = "apps/ios/scripts/ci/delivery/v3.mjs"
+REAL_V3 = '''// Delivery's Xcode, for both channels' tests and uploads: the one value to change. The plan hands it
+// to the workflow, whose test and upload jobs run on the VM image labelled xcode-<version>. The
+// pre-test hooks and the upload step assert 27.2's final build (#705; Chris owns this pin), so a move
+// off 27.2 changes those assertions too.
+export const XCODE_VERSION = '27.2';
+    'only-testing': scope.onlyTesting, 'skip-testing': scope.skipTesting, 'pre-test-script': scope.preTestScript, 'test-evidence-script': scope.evidenceScript,
+    'xcode-version': XCODE_VERSION, runner: `xcode-${XCODE_VERSION}`,
+'''
+EVO_CONSUMER = controller.Consumer(pin_paths=(".github/workflows/*.yml", ASSERTION, V3))
+
+
+def real_evo_files():
+    return {".github/workflows/ios-delivery.yml": REAL_DELIVERY_WORKFLOW,
+            ".github/workflows/ios-ci.yml": "      runner: ${{ inputs.runner == 'github-hosted' && 'macos-26-xlarge' || 'xcode-27.2' }}\n      xcode-version: \"27.2\"\n",
+            V3: REAL_V3, ASSERTION: REAL_ASSERTION, "apps/ios/README.md": "Xcode 26.6 notes, not a pin path\n"}
+
+
 def write_manifest(root: Path, entry: dict, **top) -> Path:
     manifest = root / "updates.json"
     manifest.write_text(json.dumps({"schemaVersion": 1, **top, "hosts": {"zoe-mac-mini": entry}}))
@@ -69,7 +109,7 @@ class FakeRepo:
         if argv[:2] == ["gh", "pr"] and argv[2] == "create":
             return "https://github.com/darwin-health/evo/pull/700"
         if "ls-tree" in argv:
-            return "\n".join(path for path in self.files if path.startswith(".github/workflows/"))
+            return "\n".join(self.files if "-r" in argv else (path for path in self.files if path.startswith(".github/workflows/")))
         if "ls-remote" in argv:
             return self.remote_branch
         if "worktree" in argv and "add" in argv:
@@ -164,7 +204,7 @@ class ConsumerPinTests(unittest.TestCase):
         result, repo = self.check(pinned_files())
         self.assertIs(result, True)
         self.assertEqual(repo.calls[0], ["git", "-C", "/evo", "fetch", "origin", "main"])
-        self.assertEqual(repo.calls[1], ["git", "-C", "/evo", "ls-tree", "--name-only", "origin/main", ".github/workflows/"])
+        self.assertEqual(repo.calls[1], ["git", "-C", "/evo", "ls-tree", "-r", "--name-only", "origin/main"])
 
     def test_other_xcode_version_fails(self):
         files = pinned_files()
@@ -255,8 +295,8 @@ class ConsumerPinTests(unittest.TestCase):
             command, git_file = repo.patches()
             with command, git_file:
                 self.assertIs(controller.consumer_has_pin(Path("/evo"), PIN, consumer), False, (path, extra))
-        # An exception never stands in for the pin itself.
-        only_exception = {".github/workflows/ios-delivery.yml": "jobs:\n  production:\n    with:\n      xcode-version: '26.6'\n", ASSERTION: files[ASSERTION]}
+        # An exception never stands in for the pin itself: here no pin path names the pinned version.
+        only_exception = {".github/workflows/ios-delivery.yml": "jobs:\n  production:\n    with:\n      xcode-version: '26.6'\n", ASSERTION: "build='Build version 27B52'\n"}
         repo = FakeRepo(only_exception)
         command, git_file = repo.patches()
         with command, git_file:
@@ -265,10 +305,42 @@ class ConsumerPinTests(unittest.TestCase):
             with self.assertRaises(controller.FleetError):
                 controller.read_consumer({"consumer": {"exceptions": bad}})
 
-    def test_no_workflow_mentions_xcode_version_fails(self):
-        files = pinned_files()
-        files[".github/workflows/ios-delivery.yml"] = "jobs:\n  test:\n    runs-on: xcode-27.2\n"
-        self.assertIs(self.check(files)[0], False)
+    def check_evo(self, files, pin=PIN):
+        repo = FakeRepo(files)
+        command, git_file = repo.patches()
+        with command, git_file:
+            return controller.consumer_has_pin(Path("/evo"), pin, EVO_CONSUMER)
+
+    def test_templated_workflows_with_v3_constant_and_assertion_are_pinned(self):
+        self.assertEqual(controller.pin_tokens(REAL_DELIVERY_WORKFLOW), (["27.2"], []))
+        self.assertEqual(controller.pin_tokens(REAL_ASSERTION), (["27.2"] * 5, ["27B52"]))
+        # A timestamp in a nightly comment has a build's shape; unanchored, it is not a token.
+        self.assertEqual(controller.pin_tokens("  # the 2026-10-06T1600 release\n"), ([], []))
+        self.assertEqual(controller.pin_tokens(REAL_V3), (["27.2"], []))
+        self.assertIs(self.check_evo(real_evo_files()), True)
+        # Only templated delivery plus the constant and assertion, nothing else.
+        files = real_evo_files()
+        files.pop(".github/workflows/ios-ci.yml")
+        self.assertIs(self.check_evo(files), True)
+
+    def test_v3_constant_on_another_version_is_not_pinned(self):
+        files = real_evo_files()
+        files[V3] = REAL_V3.replace("XCODE_VERSION = '27.2'", "XCODE_VERSION = '26.6'")
+        self.assertIs(self.check_evo(files), False)
+        files[V3] = REAL_V3.replace("XCODE_VERSION = '27.2'", 'XCODE_VERSION = "27.21"')
+        self.assertIs(self.check_evo(files), False)
+
+    def test_files_outside_pin_paths_are_not_judged(self):
+        files = real_evo_files()
+        files[".github/workflows/nested/x.yml"] = "xcode-version: '26.6'\n"  # * does not cross /
+        self.assertIs(self.check_evo(files), True)
+
+    def test_no_tokens_anywhere_fails(self):
+        files = {".github/workflows/ios-delivery.yml": REAL_DELIVERY_WORKFLOW.replace("xcode-27.2", "xcode-pin").replace("27B52", "the build")}
+        self.assertEqual(controller.pin_tokens(files[".github/workflows/ios-delivery.yml"]), ([], []))
+        self.assertIs(self.check_evo(files), False)
+        # Versions without any build token are not a pin either.
+        self.assertIs(self.check_evo({".github/workflows/ios-ci.yml": "xcode-version: '27.2'\n"}), False)
 
     def test_controller_names_no_retired_workflows(self):
         source = (Path(controller.__file__)).read_text()
@@ -287,6 +359,32 @@ class SubstitutionTests(unittest.TestCase):
                          "path: /Applications/Xcode_27.2.app\necho Xcode 27.2\nBuild version 27B52\nBUILD=27B52\n"
                          "keep: 26.61 xcode-26.6.1 Xcode 26.6.1 26F123\n")
 
+    def test_v3_constant_is_rewritten_and_checked(self):
+        new = controller.Pin("27.3", "27C5", "promote")
+        rewritten = controller.substitute_pin(REAL_V3, ("27.2", "27B52"), new)
+        self.assertIn("export const XCODE_VERSION = '27.3';", rewritten)
+        self.assertIn("assert 27.2's final build", rewritten)  # prose is not a pin token
+        self.assertFalse(controller.residual_pin(rewritten, ("27.2", "27B52"), new))
+        self.assertTrue(controller.residual_pin(REAL_V3, ("27.2", "27B52"), new))
+        self.assertEqual(controller.substitute_pin('XCODE_VERSION = "27.2"\n', ("27.2", "27B52"), new), 'XCODE_VERSION = "27.3"\n')
+
+    def test_real_evo_files_rewrite_end_to_end(self):
+        new = controller.Pin("27.3", "27C5", "promote")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for path, body in real_evo_files().items():
+                (root / path).parent.mkdir(parents=True, exist_ok=True)
+                (root / path).write_text(body)
+            changed = controller.rewrite_pin_files(root, set(real_evo_files()), EVO_CONSUMER.pin_paths, ("27.2", "27B52"), new)
+            self.assertEqual(changed, [".github/workflows/ios-ci.yml", ".github/workflows/ios-delivery.yml", ASSERTION, V3])
+            rewritten = {path: (root / path).read_text() for path in real_evo_files()}
+        self.assertEqual(rewritten["apps/ios/README.md"], "Xcode 26.6 notes, not a pin path\n")
+        repo = FakeRepo(rewritten)
+        command, git_file = repo.patches()
+        with command, git_file:
+            self.assertIs(controller.consumer_has_pin(Path("/evo"), new, EVO_CONSUMER), True)
+            self.assertIs(controller.consumer_has_pin(Path("/evo"), PIN, EVO_CONSUMER), False)
+
     def test_assertion_pin_reads_old_values_or_refuses(self):
         self.assertEqual(controller.assertion_pin('expected="Xcode 26.6"\nbuild="Build version 26F12"\n'), ("26.6", "26F12"))
         with self.assertRaisesRegex(controller.FleetError, "cannot read"):
@@ -301,8 +399,15 @@ class SubstitutionTests(unittest.TestCase):
             (root / "a.yml").write_text("xcode-version: '26.6'\nid: build-26F12\n")
             self.assertEqual(controller.rewrite_pin_files(root, {"a.yml"}, ("*.yml",), ("26.6", "26F12"), PIN), ["a.yml"])
             (root / "a.yml").write_text("xcode-version: '26.6'\nid: build_26F12\n")
+            self.assertEqual(controller.rewrite_pin_files(root, {"a.yml"}, ("*.yml",), ("26.6", "26F12"), PIN), ["a.yml"])
+            self.assertEqual((root / "a.yml").read_text(), "xcode-version: '27.2'\nid: build_27B52\n")
+            # The net beside the pattern set: an unknown Xcode<sep><version> form refuses.
+            (root / "a.yml").write_text("xcode-version: '26.6'\nimage: XCODE_26.6\n")
             with self.assertRaisesRegex(controller.FleetError, "left the old Xcode pin"):
                 controller.rewrite_pin_files(root, {"a.yml"}, ("*.yml",), ("26.6", "26F12"), PIN)
+            # Prose that merely mentions the old version is neither judged nor refused.
+            (root / "a.yml").write_text("xcode-version: '26.6'\n# a move off 26.6 changes the assertion too\n")
+            self.assertEqual(controller.rewrite_pin_files(root, {"a.yml"}, ("*.yml",), ("26.6", "26F12"), PIN), ["a.yml"])
 
     def test_build_only_bump_keeps_version(self):
         with tempfile.TemporaryDirectory() as temp:
