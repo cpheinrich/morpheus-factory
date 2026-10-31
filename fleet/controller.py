@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,11 @@ RUNNER_LABEL = re.compile(r"(?<![\w-])xcode-([A-Za-z0-9._]+)")
 # A version token ends where neither a word character nor ".<digit>" follows,
 # so 27.2 does not match inside 27.21 or 27.2.1.
 VERSION_END = r"(?![\w]|\.\d)"
+# Evo's script writes the identity both as "Xcode 27.2" and, inside [[ ]], as
+# the backslash-escaped "Xcode\ 27.2".
+XCODE_SPACE = r"Xcode(?: |\\ )"
+ASSERTION_VERSIONS = re.compile(r"(?<![\w/])" + XCODE_SPACE + r"([0-9]+(?:\.[0-9]+)*)")
+ASSERTION_BUILDS = re.compile(r"Build version ([A-Za-z0-9]+)")
 
 
 class FleetError(Exception):
@@ -167,7 +173,11 @@ def consumer_has_pin(root: Path, pin: Pin, consumer: Consumer) -> bool:
         assertion = git_file(root, "origin/main", consumer.assertion)
     except FleetError:
         return False
-    return f"Xcode {pin.version}" in assertion and f"Build version {pin.build}" in assertion
+    # Every identity token must be the pin; a substring test would accept 27.21
+    # for 27.2, or one updated line beside a stale one.
+    versions, builds = ASSERTION_VERSIONS.findall(assertion), ASSERTION_BUILDS.findall(assertion)
+    return (bool(versions) and bool(builds) and all(version == pin.version for version in versions)
+            and all(build == pin.build for build in builds))
 
 
 def assertion_pin(assertion: str) -> tuple[str, str]:
@@ -186,8 +196,17 @@ def substitute_pin(text: str, old: tuple[str, str], new: Pin) -> str:
     text = re.sub(r"(?<![\w-])xcode-" + old_version + VERSION_END, "xcode-" + new.version, text)
     text = re.sub(r"\bXcode_" + old_version + r"\.app", f"Xcode_{new.version}.app", text)
     text = re.sub(r"(?<![\w/])Xcode " + old_version + VERSION_END, "Xcode " + new.version, text)
+    text = re.sub(r"(?<![\w/])Xcode\\ " + old_version + VERSION_END, lambda m: "Xcode\\ " + new.version, text)
     text = re.sub(r"Build version " + old_build + r"(?![A-Za-z0-9])", "Build version " + new.build, text)
     return re.sub(r"\b" + old_build + r"\b", new.build, text)
+
+
+def residual_pin(text: str, old: tuple[str, str], new: Pin) -> bool:
+    """True when the old version or build survives substitution in any form."""
+    old_version, old_build = old
+    if old_version != new.version and re.search(r"(?<![0-9.])" + re.escape(old_version) + VERSION_END, text):
+        return True
+    return old_build != new.build and re.search(r"(?<![A-Za-z0-9])" + re.escape(old_build) + r"(?![A-Za-z0-9])", text) is not None
 
 
 def rewrite_pin_files(worktree: Path, tracked: set[str], patterns: tuple[str, ...], old: tuple[str, str], new: Pin,
@@ -200,6 +219,9 @@ def rewrite_pin_files(worktree: Path, tracked: set[str], patterns: tuple[str, ..
         path = worktree / relative
         before = path.read_text()
         after = substitute_pin(before, old, new)
+        if residual_pin(after, old, new):
+            # A pattern this rewrite does not know would leave a half-pinned file.
+            raise FleetError(f"consumer pin substitution left the old Xcode pin in {relative}")
         if after != before:
             path.write_text(after)
             changed.append(relative)
@@ -235,13 +257,19 @@ def open_pin_pr(root: Path, pin: Pin, consumer: Consumer) -> str:
     return "\n".join(f"- `{path}`" for path in changed)
 
 
-def ensure_consumer_pr(root: Path, pin: Pin, consumer: Consumer) -> tuple[str, bool]:
-    """Return (PR URL, opened this tick). Never rewrites an existing branch or PR."""
+def ensure_consumer_pr(root: Path, pin: Pin, consumer: Consumer) -> tuple[str, str]:
+    """Return (PR URL, "opened" | "open" | "closed"). Never rewrites an existing branch or PR.
+
+    A closed, unmerged PR is an operator's rejection: it is never recreated, or a
+    fresh draft would appear every tick and the agent cap would never apply.
+    """
     branch = pin_branch(pin)
-    listed = json.loads(command(["gh", "pr", "list", "--repo", consumer.repository, "--head", branch, "--state", "open",
-                                 "--json", "number,url,isDraft,mergeStateStatus"]) or "[]")
-    if listed:
-        return listed[0]["url"], False
+    listed = json.loads(command(["gh", "pr", "list", "--repo", consumer.repository, "--head", branch, "--state", "all",
+                                 "--json", "number,url,state,isDraft,mergedAt"]) or "[]")
+    for state in ("OPEN", "CLOSED"):
+        for pr in listed:
+            if pr.get("state") == state and not pr.get("mergedAt"):
+                return pr["url"], state.lower()
     if command(["git", "-C", str(root), "ls-remote", "--heads", "origin", branch]):
         files = "See the branch diff; the branch already existed when this PR was opened."
     else:
@@ -252,7 +280,7 @@ def ensure_consumer_pr(root: Path, pin: Pin, consumer: Consumer) -> tuple[str, b
             "🤖 Generated with Factory\n")
     output = command(["gh", "pr", "create", "--repo", consumer.repository, "--draft", "--head", branch, "--base", "main",
                       "--title", f"Pin iOS CI to Xcode {pin.version} (build {pin.build})", "--body", body])
-    return output.splitlines()[-1].strip(), True
+    return output.splitlines()[-1].strip(), "opened"
 
 
 def host_status(factory: Path, manifest: Path, host: str) -> dict:
@@ -319,8 +347,16 @@ def agent_prompt(pin: Pin, pr_url: str, consumer: Consumer) -> str:
 def run_agent(pin: Pin, pr_url: str, consumer: Consumer, factory: Path, root: Path) -> None:
     """One fresh, time-boxed agent run. No session is persisted or resumed."""
     argv = ["codex", "exec", "--json", "--approve-for-me", "-C", str(root), "--add-dir", str(factory), "--worktree", "-"]
-    with subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True) as process:
-        watchdog = threading.Timer(AGENT_TIMEOUT_SECONDS, lambda: process.poll() is None and process.kill())
+    # Its own process group, so the watchdog also kills grandchildren that would
+    # otherwise hold stdout open past the timeout while this tick holds the lock.
+    with subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                          start_new_session=True) as process:
+        def kill_group() -> None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        watchdog = threading.Timer(AGENT_TIMEOUT_SECONDS, kill_group)
         watchdog.daemon = True
         watchdog.start()
         assert process.stdin is not None and process.stdout is not None
@@ -338,6 +374,7 @@ def run_agent(pin: Pin, pr_url: str, consumer: Consumer, factory: Path, root: Pa
             exit_code = process.wait()
         finally:
             watchdog.cancel()
+            kill_group()
     if exit_code or not completed:
         raise FleetError("consumer pin agent did not complete")
 
@@ -350,8 +387,10 @@ def advance_consumer(config: HostConfig, factory: Path, root: Path, state_path: 
     # Only the image host drives the shared PR; others would duplicate agent runs.
     if not config.has_ci:
         return "waiting-consumer-merge"
-    url, opened = ensure_consumer_pr(root, pin, consumer)
-    if opened:
+    url, pr_state = ensure_consumer_pr(root, pin, consumer)
+    if pr_state == "closed":
+        return f"waiting-human: consumer pin PR {url} was closed; delete branch {pin_branch(pin)} to retry"
+    if pr_state == "opened":
         return "waiting-consumer-pr"
     state = private_state(state_path, pin)
     if len(state["agentRuns"]) >= AGENT_RUN_CAP:
@@ -381,11 +420,13 @@ def reconcile(factory: Path, consumer_root: Path, host_setup: Path, manifest: Pa
         # The consumer gate protects the switch; once the host runs the pin it
         # has nothing to wait for, and a tick must not open PRs for a done host.
         return "host-converged"
+    # The hold comes before the consumer step, so a held pin opens no consumer
+    # PR and spends no agent runs.
+    if config.pin.phase == "stage":
+        return "held-at-stage"
     waiting = advance_consumer(config, factory, consumer_root, state_dir / "fleet.json")
     if waiting:
         return waiting
-    if config.pin.phase == "stage":
-        return "held-at-stage"
     host_action(factory, credentials_project, manifest, host, "reconcile")
     status = host_status(factory, manifest, host)
     if not status["selectedMatches"]:
