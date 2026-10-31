@@ -577,7 +577,7 @@ class CheckTests(unittest.TestCase):
         host.free = 70 * 1024**3 - 1
         self.assertEqual(self.failing(host), ["disk"])
         host.installed = Path("/Applications/Xcode_27.2.app")
-        self.assertEqual(host.checks()["disk"], {"name": "disk", "ok": True, "detail": "pinned Xcode is already installed"})
+        self.assertEqual(host.checks()["disk"], {"name": "disk", "ok": True, "blocking": True, "detail": "pinned Xcode is already installed"})
 
     def test_refused_sudo_prints_the_install_commands(self):
         host = FakeHost(self)
@@ -681,7 +681,7 @@ class CheckTests(unittest.TestCase):
 
         host.run = broken
         checks = host.checks()
-        self.assertEqual(checks["device"], {"name": "device", "ok": False, "detail": "could not be determined: xcrun exited 1"})
+        self.assertEqual(checks["device"], {"name": "device", "ok": False, "blocking": False, "detail": "could not be determined: xcrun exited 1"})
 
     def test_session_create_and_missing_plist_fail_with_fix(self):
         host = FakeHost(self)
@@ -693,7 +693,7 @@ class CheckTests(unittest.TestCase):
         host.plist.write_bytes(controller.plistlib.dumps({"Label": host.label, "SessionCreate": False}))
         self.assertEqual(self.failing(host), [])
         host.plist.unlink()
-        self.assertEqual(host.checks()["runner"], {"name": "runner", "ok": False, "detail": f"runner LaunchAgent not installed: {host.plist}"})
+        self.assertEqual(host.checks()["runner"], {"name": "runner", "ok": False, "blocking": False, "detail": f"runner LaunchAgent not installed: {host.plist}"})
 
     def test_runner_env_must_define_required_names(self):
         host = FakeHost(self)
@@ -1059,7 +1059,7 @@ class RuntimeTests(unittest.TestCase):
         pin = self.ci_host(runtimes=["27.2"])
         with patch.object(controller, "run", side_effect=controller.UpdateError("xcrun exited 1")):
             checks = {check["name"]: check for check in controller.host_checks(pin, only=("runtimes",))}
-        self.assertEqual(checks["runtimes"], {"name": "runtimes", "ok": False, "detail": "could not be determined: xcrun exited 1"})
+        self.assertEqual(checks["runtimes"], {"name": "runtimes", "ok": False, "blocking": True, "detail": "could not be determined: xcrun exited 1"})
         self.assertEqual(controller.host_checks(self.ci_host(), only=("runtimes",)), [])
 
 

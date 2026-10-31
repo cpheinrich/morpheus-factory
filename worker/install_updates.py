@@ -31,11 +31,11 @@ def host_check(root, manifest, host, credentials_project, provider_command, prov
                             cwd=credentials_project, env=env, text=True, capture_output=True, check=False)
     try:
         document = json.loads(result.stdout or "")
-        checks = [(item["name"], bool(item["ok"]), str(item["detail"])) for item in document["checks"]]
+        checks = [(item["name"], bool(item["ok"]), str(item["detail"]), bool(item.get("blocking", True))) for item in document["checks"]]
         ok = bool(document["ok"]) and result.returncode == 0
     except (ValueError, KeyError, TypeError):
         # stderr is the controller's own one-line refusal, never child output.
-        return False, [("check", False, (result.stderr or "").strip() or f"controller check exited {result.returncode}")]
+        return False, [("check", False, (result.stderr or "").strip() or f"controller check exited {result.returncode}", True)]
     return ok, checks
 
 
@@ -67,8 +67,8 @@ def main():
         print(f"LaunchAgent: {'installed' if target.is_file() else 'missing'}")
         print(f"verification provider: {'configured' if args.provider_command and args.provider_url else 'missing'}")
         ok, checks = host_check(root, manifest, args.host, args.credentials_project, args.provider_command, args.provider_url)
-        for name, passed, detail in checks:
-            print(f"{name}: {'ok' if passed else 'FAIL'} - {detail}")
+        for name, passed, detail, blocking in checks:
+            print(f"{name}: {'ok' if passed else ('FAIL' if blocking else 'WARN')} - {detail}")
         sys.exit(0 if ok else 1)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", args.github_user):
         parser.error("GitHub user must be an account login")
@@ -79,9 +79,13 @@ def main():
     if args.provider_url and not args.provider_url.startswith("https://"):
         parser.error("provider URL must use HTTPS")
     ok, checks = host_check(root, manifest, args.host, args.credentials_project, args.provider_command, args.provider_url)
-    if not ok:
-        failed = "; ".join(f"{name}: {detail}" for name, passed, detail in checks if not passed)
-        parser.exit(1, f"install_updates.py: host check failed, not installing: {failed}\n")
+    # Only checks that gate Factory's own actions refuse the install; the rest warn.
+    blocking_failures = [f"{name}: {detail}" for name, passed, detail, blocking in checks if not passed and blocking]
+    if blocking_failures:
+        parser.exit(1, f"install_updates.py: host check failed, not installing: {'; '.join(blocking_failures)}\n")
+    for name, passed, detail, blocking in checks:
+        if not passed:
+            print(f"warning: {name}: {detail}")
     target.parent.mkdir(parents=True, exist_ok=True)
     arguments = ["/bin/bash", str(runner), "--host", args.host, "--manifest", str(manifest), "--credentials-project", str(args.credentials_project.resolve()), "--github-user", args.github_user]
     if args.provider_command:

@@ -19,7 +19,10 @@ spec.loader.exec_module(installer)
 
 HEALTHY = SimpleNamespace(returncode=0, stdout=json.dumps({"ok": True, "checks": [{"name": "sudo", "ok": True, "detail": "allowed"}]}), stderr="")
 FAILED = SimpleNamespace(returncode=1, stdout=json.dumps({"ok": False, "checks": [
-    {"name": "sudo", "ok": True, "detail": "allowed"}, {"name": "device", "ok": False, "detail": "phone is unavailable"}]}), stderr="")
+    {"name": "sudo", "ok": False, "blocking": True, "detail": "helper missing"}, {"name": "device", "ok": False, "blocking": False, "detail": "phone is unavailable"}]}), stderr="")
+# Only informational checks fail: the install proceeds and warns.
+INFORMATIONAL = SimpleNamespace(returncode=1, stdout=json.dumps({"ok": False, "checks": [
+    {"name": "sudo", "ok": True, "blocking": True, "detail": "allowed"}, {"name": "runner-groups", "ok": False, "blocking": False, "detail": "403 reading groups"}]}), stderr="")
 
 
 class InstallUpdatesTests(unittest.TestCase):
@@ -103,8 +106,8 @@ class InstallUpdatesTests(unittest.TestCase):
             project.mkdir()
             code, output, commands = self.run_installer(["--check", "--host", "zoe-mac-mini", "--credentials-project", str(project)], FAILED, home)
             self.assertEqual(code, 1)
-            self.assertIn("device: FAIL - phone is unavailable", output)
-            self.assertIn("sudo: ok - allowed", output)
+            self.assertIn("device: WARN - phone is unavailable", output)
+            self.assertIn("sudo: FAIL - helper missing", output)
             check, kwargs = commands[0]
             self.assertEqual(check[:4], ["morpheus", "credentials", "run", "--"])
             self.assertEqual(check[-6:], ["check", "--host", "zoe-mac-mini", "--manifest", str(installer.Path(SCRIPT).resolve().parents[1] / "worker/updates.json"), "--json"])
@@ -127,6 +130,14 @@ class InstallUpdatesTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertFalse((home / "Library/LaunchAgents/com.morpheus-factory.host-updates.plist").exists())
             self.assertFalse(any(args[0] == "launchctl" for args, _ in commands))
+
+    def test_install_warns_but_proceeds_on_informational_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            code, output, commands = self.run_installer(["--host", "zoe-mac-mini", "--credentials-project", directory], INFORMATIONAL, home)
+            self.assertEqual(code, 0)
+            self.assertIn("warning: runner-groups: 403 reading groups", output)
+            self.assertTrue((home / "Library/LaunchAgents/com.morpheus-factory.host-updates.plist").exists())
 
     def test_credentials_project_defaults_to_manifest_path(self):
         with tempfile.TemporaryDirectory() as directory:
