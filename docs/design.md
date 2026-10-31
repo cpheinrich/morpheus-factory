@@ -189,3 +189,54 @@ an outage — otherwise the gate quietly disappears whenever a broker misbehaves
   layer, not to keep patching it.
 - A provider shipping a documented first-party delegation mechanism: the
   emulation risk disappears and the broker becomes a plain router.
+
+## Host updates for the stateless Evo delivery pipeline — 2026-10-30
+
+Mandate, recorded for a successor session. Chris delegated this outcome in the
+Claude session "morpheus-factory worker setup" with CTO authority, no hard token
+budget, and the MacBook Air as the test host (it may register as a runner and
+change its Xcode). The brief: review [issue #9](https://github.com/cpheinrich/morpheus-factory/issues/9)
+from the Evo CD session, form an independent view, implement the improvements,
+test them on the Air, and merge. Authority covers this repository, the Air, and a
+temporary runner registration; it does not cover the MacBook Pro tonight (an Evo
+delivery run is using its selected Xcode), `device-runner/` in agent-host-setup
+(another session is changing it), or any secret.
+
+**Acceptance.** (1) `fleet/controller.py` judges Evo's pin without naming the
+workflows Evo is deleting, and no hourly tick can start an unbounded agent loop.
+(2) The two agent steps are deterministic pull requests; an agent runs only
+when a mechanical PR cannot merge on its own, fresh and time-boxed, with a cap
+per pin. (3) A host entry is portable: paths, Apple credential names and the
+credentials project are per-host manifest fields, and `check` refuses before any
+download when sudo rights, credentials, disk, the runner LaunchAgent, signing
+identities or the paired phone are wrong. (4) `activate` defers while a runner
+job is live. (5) Promotion keeps the selected Xcode plus one previous and removes
+older `Xcode_<version>.app` bundles. (6) The MacBook Pro has a phone-gate host
+entry whose validation is a signed device build. (7) Everything above is covered
+by unit tests, and the Air run of `setup.sh`, `check` and the runner install is
+recorded with its actual output.
+
+**Decisions.**
+
+- *The `phase` gate is now an optional hold, not a step an agent flips.* The
+  controller already refuses to switch a host before the image is verified, the
+  consumer's main carries the pin and the host validation passes; a mechanical
+  phase flip after those gates added a PR and an agent run and no judgment.
+  `phase: "stage"` still holds a host at staging when an operator wants that.
+- *Consumer pin PRs are substitutions, not prompts.* The current pin is read
+  from Evo's assertion script on main; every workflow and script under the
+  declared paths has the old version and build replaced by the new ones, and
+  the PR is opened as a draft under Evo's normal gates. A fresh `codex exec`
+  carries it through tests, review and merge only when the draft is still open
+  on a later tick, at most three times per pin; after that the tick reports and
+  spends nothing.
+- *Unused simulator runtimes are not deleted.* Runtimes are shared by every
+  Xcode on the host and by CI's pinned destination OS; removing one can break a
+  job that never asked for an Xcode change. Only `Xcode_<version>.app` bundles
+  beyond the retained two are removed.
+- *Generic persistent runners get a Factory-owned LaunchAgent.* The stock
+  `svc.sh` plist sets `SessionCreate`, which locks the login keychain in the
+  runner's session and breaks `codesign` with `errSecInternalComponent`
+  (proven on the Pro on 2026-10-30). Factory writes its own plist without it.
+  Evo's restricted device runner keeps its installer in agent-host-setup; Factory
+  only checks its plist.
