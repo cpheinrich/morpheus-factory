@@ -135,6 +135,7 @@ the operator as a root-owned copy and allowed by a single sudoers line.
 not create parents, so create it first:
 
 ```sh
+# worker/setup.sh runs this stage for you (worker/setup/root-helper.sh); by hand:
 sudo install -d -o root -g wheel -m 755 /usr/local/libexec
 sudo install -o root -g wheel -m 755 worker/xcode-root-helper.sh /usr/local/libexec/morpheus-factory-xcode
 sudo visudo -f /etc/sudoers.d/morpheus-factory

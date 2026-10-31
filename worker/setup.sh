@@ -17,7 +17,7 @@ done
 git -C "$FACTORY_ROOT" rev-parse --git-dir >/dev/null 2>&1 || { echo "Run from a morpheus-factory clone" >&2; exit 1; }
 export FACTORY_ROOT WORKER_CODE_ROOT WORKER_CHECK_ONLY
 
-for stage in prerequisites apps tools source morpheus spotlight factory cleanup; do
+for stage in prerequisites apps tools root-helper source morpheus spotlight factory cleanup; do
   echo "== $stage"
   bash "$FACTORY_ROOT/worker/setup/$stage.sh"
 done
