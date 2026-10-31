@@ -659,10 +659,16 @@ def helper_status(path=None):
 def helper_ancestors():
     # A writable ancestor (Intel Homebrew owns /usr/local) would let the worker
     # user swap the root-owned helper out from under the sudoers rule.
-    # Resolve first: a root-owned symlink into a tree with a writable parent
-    # would pass a check on the path as written.
-    path = Path(HELPER_PATH).resolve()
-    return [str(parent) for parent in path.parents]
+    # Both the path as written in sudoers and its resolution: a symlinked
+    # directory in the written path (Intel Homebrew's /usr/local/libexec) sits
+    # in a parent the resolved path never visits, and a root-owned symlink into
+    # a tree with a writable parent would pass a check on the written path alone.
+    written = Path(HELPER_PATH)
+    seen = []
+    for parent in (*written.parents, *written.resolve().parents):
+        if str(parent) not in seen:
+            seen.append(str(parent))
+    return seen
 
 
 def check_sudo(pin):

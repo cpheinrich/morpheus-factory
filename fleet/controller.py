@@ -261,10 +261,12 @@ def ensure_consumer_pr(root: Path, pin: Pin, consumer: Consumer) -> tuple[str, s
     """Return (PR URL, "opened" | "open" | "closed" | "merged"). Never rewrites an existing branch or PR.
 
     Called only while merged main lacks the pin. An open PR wins; otherwise the
-    newest PR decides. A closed, unmerged PR is an operator's rejection: it is
-    never recreated, or a fresh draft would appear every tick and the agent cap
-    would never apply. A merged PR whose branch survives means main was reverted;
-    GitHub refuses a new PR from that branch, so a human decides.
+    newest PR decides while its branch exists. A closed, unmerged PR is an
+    operator's rejection and is not recreated, or a fresh draft would appear
+    every tick and the agent cap would never apply. A merged PR whose branch
+    survives means main was reverted; GitHub refuses a new PR from that branch,
+    so a human decides. Deleting the branch is the retry in both cases, because
+    GitHub keeps listing old PRs; an operator who means to reject keeps the branch.
     """
     branch = pin_branch(pin)
     listed = json.loads(command(["gh", "pr", "list", "--repo", consumer.repository, "--head", branch, "--state", "all",

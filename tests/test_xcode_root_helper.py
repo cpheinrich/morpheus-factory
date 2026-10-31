@@ -49,7 +49,10 @@ if [[ "$1" == -p ]]; then [[ -s {self.selected} ]] || exit 1; cat {self.selected
         executable(bin_dir / "spctl", f'echo "spctl $*" >> {self.log}; [[ "$(cat {self.signed})" == yes ]]\n')
         executable(bin_dir / "rm", f'echo "rm $*" >> {self.log}\n')
         # A valid signature alone is not enough: the fake only accepts Apple's Xcode requirement.
-        executable(bin_dir / "codesign", f'echo "codesign $*" >> {self.log}; [[ "$*" == *"-R=identifier \\"com.apple.dt.Xcode\\" and anchor apple"* && "$(cat {self.signed})" == yes ]]\n')
+        executable(bin_dir / "codesign", f'''echo "codesign $*" >> {self.log}
+for arg in "$@"; do [[ "$arg" == -R=* ]] && requirement="${{arg#-R=}}"; done
+[[ "${{requirement:-}}" == 'identifier "com.apple.dt.Xcode" and anchor apple' && "$(cat {self.signed})" == yes ]]
+''')
         executable(bin_dir / "mv", f'echo "mv $*" >> {self.log}; /bin/mv "$@"\n')
         executable(bin_dir / "cp", f'echo "cp $*" >> {self.log}; /bin/cp "$@"\n')
         # Fakes for root-only steps: record, and make the tree read-only the way
@@ -116,7 +119,8 @@ exit 0
             app = self.app(name)
             code, _, log = self.call("select", app)
             self.assertEqual(code, 0)
-            self.assertEqual(log[-2:], [f"spctl --assess --type execute {app}", f"xcode-select --switch {app}/Contents/Developer"])
+            self.assertEqual(log[-3:], [f'codesign --verify --deep --strict -R=identifier "com.apple.dt.Xcode" and anchor apple {app}',
+                                        f"spctl --assess --type execute {app}", f"xcode-select --switch {app}/Contents/Developer"])
 
     def test_paths_outside_the_patterns_are_refused_before_any_action(self):
         self.app("Xcode_27.2.app")
@@ -150,7 +154,7 @@ exit 0
         self.signed.write_text("no")
         code, stderr, log = self.call("select", app)
         self.assertEqual(code, 1)
-        self.assertIn("not an Apple-signed app", stderr)
+        self.assertIn("not Apple's Xcode", stderr)
         self.assertFalse(any(line.startswith(("xcode-select", "xcodebuild")) for line in log))
 
     def test_install_quarantines_before_verifying_or_executing(self):
@@ -293,8 +297,9 @@ exit 0
         source = SCRIPT.read_text()
         self.assertIn("""REQUIREMENT='identifier "com.apple.dt.Xcode" and anchor apple'""", source)
         self.assertIn('--verify --deep --strict -R="$REQUIREMENT"', source)
+        # The fake codesign accepts only the exact requirement text, so a weakened
+        # or missing -R= in the script fails every install test, not just this one.
         app, _ = self.expanded()
-        # Drop the requirement from the fake's acceptance: the script must still pass it.
         code, _, log = self.call("install", app, "27.2")
         self.assertEqual(code, 0)
         self.assertTrue(any(line.startswith("codesign --verify --deep --strict -R=identifier") for line in log))

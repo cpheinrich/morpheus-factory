@@ -99,7 +99,10 @@ identity() { "$STAT" -L -f '%d:%i' "$1"; }
 
 case "$verb" in
   select)
-    # Runs only Apple's xcode-select as root; the bundle's own code does not run.
+    # Runs only Apple's xcode-select as root; the bundle's own code does not run
+    # here, but a later root process using an xcrun shim would, so only Apple's
+    # Xcode may be selected. Nothing on a worker host should run developer tools as root.
+    "$CODESIGN" --verify --deep --strict -R="$REQUIREMENT" "$app" >/dev/null 2>&1 || refuse "not Apple's Xcode: $app"
     "$SPCTL" --assess --type execute "$app" >/dev/null 2>&1 || refuse "not an Apple-signed app: $app"
     "$XCODE_SELECT" --switch "$app/Contents/Developer" ;;
   remove)
