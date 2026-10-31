@@ -298,7 +298,14 @@ def stage_ci_image(version, build, stage_root, verification, components, ci, app
     except (OSError, ValueError):
         cached = False
     if not cached:
-        run([ci["verifier"], "--name", image, "--version", version, "--build", build, *runtime_args], env=ci_environment(), capture=False, timeout=900)
+        try:
+            run([ci["verifier"], "--name", image, "--version", version, "--build", build, *runtime_args], env=ci_environment(), capture=False, timeout=900)
+        except UpdateError as error:
+            # A sealed image is never rebuilt automatically, so one built before
+            # the runtimes list changed fails here every tick until it is moved.
+            raise UpdateError(f"CI image {image} failed verification ({error}); if it predates the current ci.runtimes, "
+                              f"run `tart rename {image} {image}-stale` (or `tart delete {image}`), then rerun image-stage "
+                              "to rebuild it") from error
         if image_identity(image) != identity:
             raise UpdateError("CI image changed during verification")
         receipt.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -576,7 +583,12 @@ def activate(version, build, state_dir=None):
     if not report(version, build)["selectedMatches"]:
         raise UpdateError("xcode-select did not select the approved Xcode")
     if state_dir is not None:
-        record_promotion(state_dir, version, build, previous)
+        if previous != str(app / "Contents/Developer"):
+            record_promotion(state_dir, version, build, previous)
+        else:
+            # Re-activating the pin by hand is not a promotion: keep the window
+            # start and the real previous app, which retire depends on.
+            ensure_promotion_record(state_dir, version, build)
     return "activated"
 
 
@@ -679,9 +691,11 @@ def prune(version, build, retain, previous=None, window=False):
     /Applications/Xcode.app symlink. During the migration window (`window`:
     promoted but not yet validated) at least two bundles stay, so the previous
     Xcode survives until delivery is green whatever `retain` says.
+    Returns the removed paths, or None when the host is busy and nothing was
+    considered, so a caller can tell "nothing to remove" from "not now".
     """
     if host_is_busy():
-        return []
+        return None
     current = report(version, build)
     if not current["selectedMatches"]:
         raise UpdateError("approved Xcode is not selected; pruning refused")
@@ -741,6 +755,10 @@ def retire(pin, state_dir):
     if previous is not None and selected is not None and previous.resolve() == selected.resolve():
         raise UpdateError("the previous Xcode is the selected one; retire refused")
     removed = prune(version, build, pin.retain)
+    if removed is None:
+        # A job started after the first check: retire nothing, so the next tick
+        # retries instead of stamping retiredAt over a previous app still present.
+        return "deferred-busy", []
     if pin.role == "ci-image":
         pruner = image_pruner(pin)
         if not Path(pruner).is_absolute() or not os.access(pruner, os.X_OK):
@@ -989,7 +1007,8 @@ def check_device(pin):
         name = (device.get("deviceProperties") or {}).get("name", "unnamed device")
         tunnel, pairing = connection.get("tunnelState"), connection.get("pairingState")
         detail = f"{udid} ({name}, {connection.get('transportType', 'unknown transport')}): pairing {pairing}, tunnel {tunnel}"
-        if tunnel == "connected" and pairing == "paired":
+        # An idle wired phone reports a disconnected tunnel; it opens on demand.
+        if pairing == "paired" and (tunnel == "connected" or connection.get("transportType") == "wired"):
             return True, detail
         if pairing == "paired" and tunnel == "disconnected":
             return False, f"{detail}; paired but not connected: connect and unlock the iPhone"
@@ -1101,7 +1120,7 @@ def main():
             if result in ("promoted", "already-current"):
                 record = promotion(state_dir, version, build)
                 extra["removed"] = prune(version, build, pin.retain, [before["selected"], record and record.get("previous")],
-                                         window=in_window(state_dir, version, build))
+                                         window=in_window(state_dir, version, build)) or []
         elif args.command == "retire":
             result, extra["removed"] = retire(pin, state_dir)
         else:

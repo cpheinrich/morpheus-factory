@@ -110,10 +110,12 @@ check fails. A check that cannot determine its answer reports `ok: false` with
     ambiguous; the detail lists both SHA-1 fingerprints so one can be removed.
 12. `device` (with `device.udid`) — `xcrun devicectl list devices --json-output <file>`
     lists a device whose `hardwareProperties.udid` is the UDID (case-insensitive)
-    with `pairingState` `paired` and `tunnelState` `connected`. The plain listing
+    with `pairingState` `paired` and either `tunnelState` `connected` or
+    `transportType` `wired` (an idle wired phone's tunnel opens on demand, so it may
+    report `disconnected`). The plain listing
     prints CoreDevice identifiers, not UDIDs, so only the JSON is read. The detail
     names the device, transport and states; an absent UDID is "not paired to this
-    Mac", a disconnected tunnel is "paired but not connected", and a command or
+    Mac", a disconnected tunnel over the network is "paired but not connected", and a command or
     JSON failure is "could not be determined".
 13. `validation` — each validation executable exists and is executable.
 
@@ -301,7 +303,9 @@ In steady state a host keeps **one** Xcode, the pin (`xcode.retain` defaults to
 `status` reports `promotedAt` and `retiredAt` for the current pin (`null` when
 absent or for another pin). A host that already selected the pin before records
 existed gets one on its next `reconcile`, timed when first seen and with
-`previous: null`, so only a later delivery run can validate it.
+`previous: null`, so only a later delivery run can validate it. Re-running `activate` on a host that
+already selects the pin keeps an existing record (its `promotedAt` and real
+`previous`).
 
 **Migration window.** Until `retire` has run for the pin, pruning after a
 promotion or on an `already-current` reconcile keeps at least two bundles,
@@ -325,8 +329,8 @@ newest completed run of the consumer's delivery workflow on main started after
 morpheus credentials run -- python3 worker/update_controller.py retire --host <host> --manifest worker/updates.json
 ```
 
-returns `{"result": "retired", "removed": [...]}`. It returns `deferred-busy`
-and removes nothing while `xcodebuild`, `swift-frontend` or `Runner.Worker` is
+returns `{"result": "retired", "removed": [...]}`. It returns `deferred-busy`,
+removes nothing, prunes no images and leaves the window open while `xcodebuild`, `swift-frontend` or `Runner.Worker` is
 running; refuses when the pin is not selected, when there is no promotion record
 for the pin, or when the recorded previous app is the selected one. It prunes to
 `retain` with no migration-window protection. On ci-image hosts it then runs
@@ -358,9 +362,11 @@ activator makes it the host-wide default, so after activation the previous
 
 With `ci.runtimes`, `image-stage` passes `--runtime <version>` for each listed
 runtime, in order, to both the builder and the verifier, and the receipt records
-the list: changing it forces a fresh guest verification on the next tick. An
-image built before a runtime was added fails that verification; delete it
-(`tart delete ci-xcode-<version>`) so the next tick rebuilds it. The image name
+the list: changing it forces a fresh guest verification on the next tick. A
+sealed image is never rebuilt automatically, so one built before a runtime was
+added fails that verification on every tick; the error says what to do: run
+`tart rename ci-xcode-<version> ci-xcode-<version>-stale` (or
+`tart delete ci-xcode-<version>`), then rerun `image-stage` to rebuild it. The image name
 stays `ci-xcode-<version>`.
 The consumer workflow still moves by reviewed PR, and the host pin moves to
 `promote` only after the consumer's CI run passes.

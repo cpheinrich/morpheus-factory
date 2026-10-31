@@ -647,11 +647,17 @@ class CheckTests(unittest.TestCase):
         host = FakeHost(self)
         self.assertEqual(host.checks()["device"]["detail"], f"{UDID} (Zoe\u2019s iPhone, wired): pairing paired, tunnel connected")
         devices = host.devicectl["result"]["devices"]
+        # An idle wired phone's tunnel is down until needed: still a pass.
+        devices[0]["connectionProperties"].update(tunnelState="disconnected")
+        self.assertEqual(self.failing(host), [])
+        self.assertIn("wired): pairing paired, tunnel disconnected", host.checks()["device"]["detail"])
         devices[0]["connectionProperties"].update(tunnelState="disconnected", transportType="localNetwork")
         self.assertEqual(self.failing(host), ["device"])
         self.assertIn("paired but not connected", host.checks()["device"]["detail"])
         self.assertIn("localNetwork", host.checks()["device"]["detail"])
-        devices[0]["connectionProperties"].update(tunnelState="connected", pairingState="unpaired")
+        devices[0]["connectionProperties"].update(tunnelState="connected", transportType="localNetwork")
+        self.assertEqual(self.failing(host), [])
+        devices[0]["connectionProperties"].update(tunnelState="connected", pairingState="unpaired", transportType="wired")
         self.assertEqual(self.failing(host), ["device"])
         del devices[0]
         self.assertEqual(host.checks()["device"]["detail"], f"{UDID} is not paired to this Mac; pair and connect the iPhone")
@@ -718,7 +724,7 @@ class CheckTests(unittest.TestCase):
 
     def test_check_command_exits_nonzero_but_prints_json(self):
         host = FakeHost(self)
-        host.devicectl["result"]["devices"][0]["connectionProperties"]["tunnelState"] = "disconnected"
+        host.devicectl["result"]["devices"][0]["connectionProperties"].update(tunnelState="disconnected", transportType="localNetwork")
         output = io.StringIO()
         argv = ["update_controller.py", "check", "--host", "pro", "--manifest", str(host.manifest), "--json"]
         with patch.object(sys, "argv", argv), redirect_stdout(output), host.patched():
@@ -801,7 +807,7 @@ class PreflightTests(unittest.TestCase):
 
     def test_preflight_covers_only_install_facts(self):
         host = FakeHost(self)
-        host.devicectl["result"]["devices"][0]["connectionProperties"]["tunnelState"] = "disconnected"
+        host.devicectl["result"]["devices"][0]["connectionProperties"].update(tunnelState="disconnected", transportType="localNetwork")
         with host.patched():
             controller.preflight(host.pin)
         self.assertEqual(controller.PREFLIGHT, ("xcodes", "disk", "sudo", "apple-credentials", "verification-provider", "paths"))
@@ -913,7 +919,9 @@ class PruneTests(unittest.TestCase):
         self.assertEqual(self.prune(["27.2", "27.0", "26.3"], 1, symlink="26.3"), ["Xcode_27.0.app"])
 
     def test_busy_host_prunes_nothing(self):
-        self.assertEqual(self.prune(["27.2", "27.0", "26.3"], 1, busy=True), [])
+        with patch.object(controller, "host_is_busy", return_value=True), patch.object(controller, "root_helper") as helper:
+            self.assertIsNone(controller.prune("27.2", "27B52", 1))
+        helper.assert_not_called()
 
     def test_unreadable_bundle_is_never_removed(self):
         self.assertEqual(self.prune(["27.2", "27.0", "26.3"], 2, unreadable=["Xcode_26.3.app"]), [])
@@ -985,6 +993,29 @@ class RuntimeTests(unittest.TestCase):
         receipt = json.loads((Path(temporary.name) / "ci-images/ci-xcode-27.2.json").read_text())
         self.assertEqual(receipt["runtimes"], ["26.5", "27.2"])
 
+    def test_failed_verification_says_how_to_rebuild_a_stale_image(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        ci = {"image": "ci-xcode-27.2", "label": "xcode-27.2", "repository": "darwin-health/evo", "tart": "/t", "runtimes": ["26.5"],
+              "builder": "/b/build-image.sh", "verifier": "/b/verify-image.sh", "activator": "/b/activate-pool.mjs"}
+
+        def command(argv, **kwargs):
+            if argv[0] == "/b/verify-image.sh":
+                raise controller.UpdateError("verify-image.sh exited 1")
+            return ""
+
+        with patch.object(controller, "matching_app", return_value=Path("/Applications/Xcode_27.2.app")), \
+             patch.object(controller, "image_is_sealed", return_value=True), \
+             patch.object(controller, "image_identity", return_value={"disk.img": {"inode": 1}}), \
+             patch.object(controller, "run", side_effect=command) as run:
+            with self.assertRaises(controller.UpdateError) as caught:
+                controller.stage_ci_image("27.2", "27B52", Path(temporary.name), None, [], ci)
+        message = str(caught.exception)
+        self.assertIn("tart rename ci-xcode-27.2 ci-xcode-27.2-stale", message)
+        self.assertIn("tart delete ci-xcode-27.2", message)
+        # Sealed: never rebuilt automatically, and nothing activated.
+        self.assertEqual([call.args[0][0] for call in run.call_args_list], ["/b/verify-image.sh"])
+
     def test_no_runtimes_passes_no_runtime_flags(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -1055,6 +1086,25 @@ class PromotionTests(unittest.TestCase):
         self.assertRegex(record["promotedAt"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00$")
         self.assertEqual(list(self.state.iterdir()), [path])  # no temporary left behind
 
+    def test_reactivating_the_selected_pin_keeps_the_promotion_record(self):
+        selected = "/Applications/Xcode_27.2.app/Contents/Developer"
+        controller.record_promotion(self.state, "27.2", "27B52", "/Applications/Xcode_26.3.app/Contents/Developer")
+        original = controller.promotion(self.state, "27.2", "27B52")
+
+        def command(argv, **kwargs):
+            return "/sbin/launchd\n" if argv[0] == "/bin/ps" else (selected if argv[0] == "/usr/bin/xcode-select" else "")
+
+        with patch.object(controller, "matching_app", return_value=Path("/Applications/Xcode_27.2.app")), \
+             patch.object(controller, "run", side_effect=command), patch.object(controller, "report", return_value={"selectedMatches": True}), \
+             patch.object(controller, "now_iso", return_value="2099-01-01T00:00:00+00:00"):
+            controller.activate("27.2", "27B52", self.state)
+            self.assertEqual(controller.promotion(self.state, "27.2", "27B52"), original)
+            # With no record, a re-activation records the window without naming the selected app as previous.
+            (self.state / "promoted.json").unlink()
+            controller.activate("27.2", "27B52", self.state)
+        record = controller.promotion(self.state, "27.2", "27B52")
+        self.assertEqual((record["previous"], record["promotedAt"]), (None, "2099-01-01T00:00:00+00:00"))
+
     def test_failed_activation_writes_no_record(self):
         with patch.object(controller, "matching_app", return_value=Path("/Applications/Xcode_27.2.app")), \
              patch.object(controller, "run", return_value=""), patch.object(controller, "report", return_value={"selectedMatches": False}):
@@ -1114,6 +1164,17 @@ class RetireTests(unittest.TestCase):
         self.assertNotIn("env", commands[0][1])  # run's default allowlist, no GitHub auth
         self.assertIsNotNone(controller.promotion(self.state, "27.2", "27B52")["retiredAt"])
         self.assertFalse(controller.in_window(self.state, "27.2", "27B52"))
+
+    def test_host_turning_busy_during_retire_defers_without_images_or_stamp(self):
+        # Busy at prune time though idle at the first check: a job started between them.
+        controller.record_promotion(self.state, "27.2", "27B52", "/Applications/Xcode_26.3.app/Contents/Developer")
+        with patch.object(controller, "host_is_busy", side_effect=[False, True]), \
+             patch.object(controller, "report", return_value={"selectedMatches": True, "selected": "/Applications/Xcode_27.2.app/Contents/Developer"}), \
+             patch.object(controller, "root_helper") as helper, patch.object(controller, "run") as run:
+            self.assertEqual(controller.retire(self.pin, self.state), ("deferred-busy", []))
+        helper.assert_not_called()
+        run.assert_not_called()
+        self.assertTrue(controller.in_window(self.state, "27.2", "27B52"))
 
     def test_busy_host_retires_nothing(self):
         (result, removed), prune, commands = self.retire(busy=True)
