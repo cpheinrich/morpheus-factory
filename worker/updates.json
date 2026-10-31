@@ -15,7 +15,6 @@
   "hosts": {
     "zoe-mac-mini": {
       "role": "ci-image",
-      "hold": "Factory tick paused 2026-10-30: Xcode 27.2 (27B52) remains Evo's pin and the Mini's selected Xcode; the 27.2 UI-suite failures were traced to Evo source changes, not the toolchain. Resume (remove this hold) after `install_updates.py --check` passes on the host, which needs the root helper from #10 installed there.",
       "xcode": {
         "version": "27.2",
         "build": "27B52",
