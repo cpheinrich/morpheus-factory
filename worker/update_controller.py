@@ -542,19 +542,42 @@ def interactive_login(apple=None):
     return "apple-authenticated"
 
 
+IDLE_WAIT_SECONDS = 2 * 60 * 60
+IDLE_POLL_SECONDS = 30
+
+
+def wait_until_idle(timeout=IDLE_WAIT_SECONDS, poll=IDLE_POLL_SECONDS):
+    """Return True once no runner job or build is live, or False after timeout."""
+    deadline = time.monotonic() + timeout
+    while host_is_busy():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll)
+    return True
+
+
 def ensure_components(app, components):
+    # Component installs (cryptexes) rewrite shared frameworks under any
+    # running xcodebuild, like first launch does; never while CI is busy.
+    if components and host_is_busy():
+        return False
     child = {key: os.environ[key] for key in ("HOME", "PATH", "TMPDIR", "LANG", "USER", "LOGNAME") if key in os.environ}
     child["DEVELOPER_DIR"] = str(app / "Contents/Developer")
     for component in components:
         run([str(app / "Contents/Developer/usr/bin/xcodebuild"), "-downloadComponent", component], env=child, capture=False, timeout=7200)
+    return True
 
 
 def stage(version, build, stage_root, verification=None, components=(), apple=None):
     app = app_path(version)
     existing = matching_app(version, build)
     if existing is not None:
-        ensure_components(existing, components)
-        return "already-installed"
+        return "already-installed" if ensure_components(existing, components) else "deferred-busy"
+    # Staging's first launch rewrites shared system frameworks; on the Pro
+    # (2026-10-31) it killed a running CD phone gate. Do not even start while
+    # a runner job or build is live, and check again before first launch.
+    if host_is_busy():
+        return "deferred-busy"
     have = installed_build(app)
     if have is not None or app.exists():
         raise UpdateError(f"{app} exists with the wrong build; refusing overwrite")
@@ -581,6 +604,8 @@ def stage(version, build, stage_root, verification=None, components=(), apple=No
         # The helper moves the bundle into a root-only quarantine, verifies its
         # signature there, runs first launch, and only then installs it, so
         # nothing the worker user can still write ever runs as root.
+        if not wait_until_idle():
+            raise UpdateError("host stayed busy for two hours after the download; staging deferred (download discarded)")
         root_helper("install", expanded, version, capture=False)
     require_readable(app)
     if installed_build(app) != (version, build):
