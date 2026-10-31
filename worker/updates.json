@@ -9,7 +9,8 @@
     ],
     "ignorePaths": [
       ".github/workflows/cd-v2-*.yml"
-    ]
+    ],
+    "deliveryWorkflow": "ios-delivery.yml"
   },
   "hosts": {
     "zoe-mac-mini": {
@@ -43,7 +44,8 @@
         "label": "xcode-27.2",
         "builder": "/Users/zoe/code/agent-host-setup/ci-vm/build-image.sh",
         "verifier": "/Users/zoe/code/agent-host-setup/ci-vm/verify-image.sh",
-        "activator": "/Users/zoe/code/agent-host-setup/ci-vm/activate-pool.mjs"
+        "activator": "/Users/zoe/code/agent-host-setup/ci-vm/activate-pool.mjs",
+        "runtimes": ["26.5", "27.2"]
       },
       "validation": [
         {

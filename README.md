@@ -147,7 +147,9 @@ reconciler. It pins exact version and build, stages the approved app beside the
 current one, and validates before changing `xcode-select`. The
 [`fleet controller`](fleet/README.md) carries a reviewed pin through the Tart
 image, a deterministic draft PR on Evo, and host promotion; a fresh, capped
-agent runs only when that PR cannot merge by itself. `update_controller.py check`
+agent runs only when that PR cannot merge by itself. Once Evo's delivery workflow
+is green after a promotion, the host retires its previous Xcode and CI image, so a
+host keeps one Xcode in steady state. `update_controller.py check`
 refuses before any download when sudo rights, credentials, disk, a runner
 LaunchAgent, signing identities or the paired phone are wrong. The hourly
 LaunchAgent fast-forwards a clean Factory checkout before reconciling the

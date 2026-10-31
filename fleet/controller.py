@@ -29,6 +29,9 @@ from pathlib import Path
 VERSION = re.compile(r"[0-9]+(?:\.[0-9]+){1,2}\Z")
 BUILD = re.compile(r"[A-Za-z0-9]+\Z")
 REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+WORKFLOW_FILE = re.compile(r"[A-Za-z0-9_.-]+\.ya?ml\Z")
+DEFAULT_DELIVERY_WORKFLOW = "ios-delivery.yml"
+KEPT = "host-converged (previous Xcode kept until delivery is green)"
 ROLES = ("ci-image", "phone-gate")
 AGENT_RUN_CAP = 3
 AGENT_TIMEOUT_SECONDS = 7200
@@ -77,6 +80,9 @@ class Consumer:
     # UI-suite regression is triaged. They are not judged; they are not rewritten
     # either, because substitution only touches the previous pin's tokens.
     exceptions: tuple[tuple[str, str], ...] = ()
+    # The workflow whose green run on main, after a host's promotion, validates
+    # the pin and lets the host retire its previous Xcode.
+    delivery_workflow: str = DEFAULT_DELIVERY_WORKFLOW
 
     def ignores(self, path: str) -> bool:
         return any(fnmatch.fnmatch(path, pattern) for pattern in self.ignore_paths)
@@ -129,8 +135,11 @@ def read_consumer(data: dict) -> Consumer:
                 or not isinstance(entry.get("reason"), str) or not entry["reason"].strip():
             raise FleetError("each consumer exception needs a relative path, an exact version and a reason")
         pairs.append((_relative_path(entry.get("path")), entry["version"]))
+    delivery_workflow = raw.get("deliveryWorkflow", default.delivery_workflow)
+    if not isinstance(delivery_workflow, str) or not WORKFLOW_FILE.fullmatch(delivery_workflow):
+        raise FleetError("consumer deliveryWorkflow must be a workflow file name")
     return Consumer(repository, assertion, tuple(_relative_path(path) for path in pin_paths),
-                    tuple(_relative_path(path) for path in ignore_paths), tuple(pairs))
+                    tuple(_relative_path(path) for path in ignore_paths), tuple(pairs), delivery_workflow)
 
 
 def read_host(manifest: Path, host: str) -> HostConfig:
@@ -324,8 +333,8 @@ def host_status(factory: Path, manifest: Path, host: str) -> dict:
     return status
 
 
-def host_action(factory: Path, credentials_project: Path, manifest: Path, host: str, action: str) -> None:
-    if action not in ("stage", "image-stage", "reconcile"):
+def host_action(factory: Path, credentials_project: Path, manifest: Path, host: str, action: str) -> str:
+    if action not in ("stage", "image-stage", "reconcile", "retire"):
         raise FleetError("invalid host action")
     # The credentials companion injects Apple login only into this child.
     # Image staging also needs GitHub auth to fetch CI runner/action packages;
@@ -333,10 +342,10 @@ def host_action(factory: Path, credentials_project: Path, manifest: Path, host: 
     excluded = () if action == "image-stage" else (
         "GH_TOKEN", "FACTORY_GH_TOKEN", "GIT_ASKPASS", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0")
     env = {key: value for key, value in os.environ.items() if key not in excluded}
-    command(["morpheus", "credentials", "run", "--", sys.executable,
-             str(factory / "worker/update_controller.py"), action,
-             "--host", host, "--manifest", str(manifest)], cwd=credentials_project, env=env,
-            timeout=14400 if action in ("stage", "image-stage") else 7200)
+    return command(["morpheus", "credentials", "run", "--", sys.executable,
+                    str(factory / "worker/update_controller.py"), action,
+                    "--host", host, "--manifest", str(manifest)], cwd=credentials_project, env=env,
+                   timeout=14400 if action in ("stage", "image-stage") else 7200)
 
 
 def sync_host_tools(host_setup: Path) -> None:
@@ -437,6 +446,69 @@ def advance_consumer(config: HostConfig, factory: Path, root: Path, state_path: 
     return None if consumer_has_pin(root, pin, consumer) else "waiting-consumer-merge"
 
 
+def _instant(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else None
+
+
+def latest_delivery_run(consumer: Consumer) -> dict | None:
+    """The newest completed delivery run on consumer main, or None when unknown."""
+    try:
+        runs = json.loads(command(["gh", "run", "list", "--repo", consumer.repository, "--workflow", consumer.delivery_workflow,
+                                   "--branch", "main", "--status", "completed", "--limit", "1",
+                                   "--json", "createdAt,url,conclusion"]) or "[]")
+    except (FleetError, ValueError):
+        return None
+    return runs[0] if isinstance(runs, list) and runs and isinstance(runs[0], dict) else None
+
+
+def delivery_validated(config: HostConfig, consumer_root: Path, promoted_at: object) -> bool:
+    """Validated: merged consumer main carries the pin and the newest completed
+    delivery run started after the promotion and succeeded. Unknown is never validated."""
+    promoted = _instant(promoted_at)
+    if promoted is None:
+        return False
+    run = latest_delivery_run(config.consumer)
+    created = _instant(run.get("createdAt")) if run else None
+    return bool(run) and run.get("conclusion") == "success" and created is not None and created > promoted
+
+
+def retire_if_validated(config: HostConfig, factory: Path, credentials_project: Path, manifest: Path, host: str,
+                        consumer_root: Path, status: dict) -> str:
+    """On a converged host, remove the previous Xcode (and unreferenced CI images) once delivery is green."""
+    if status.get("retiredAt"):
+        return "host-converged"
+    try:
+        pinned = consumer_has_pin(consumer_root, config.pin, config.consumer)
+    except (FleetError, OSError, ValueError):
+        return KEPT
+    if not pinned:
+        return KEPT
+    if not status.get("promotedAt"):
+        # Selected before promotion records existed: the worker's reconcile
+        # records the window start now, so only a later delivery run counts.
+        host_action(factory, credentials_project, manifest, host, "reconcile")
+        return KEPT
+    if not delivery_validated(config, consumer_root, status["promotedAt"]):
+        return KEPT
+    output = host_action(factory, credentials_project, manifest, host, "retire")
+    try:
+        result = json.loads(output.splitlines()[-1])
+    except (IndexError, ValueError) as error:
+        raise FleetError("invalid host retire result") from error
+    if not isinstance(result, dict) or not isinstance(result.get("removed"), list):
+        raise FleetError("invalid host retire result")
+    if result.get("result") == "deferred-busy":
+        return "host-converged (retire deferred: host busy)"
+    removed = ", ".join(str(path) for path in result["removed"]) or "no Xcode bundles"
+    return f"host-converged (retired: {removed})"
+
+
 def reconcile(factory: Path, consumer_root: Path, host_setup: Path, manifest: Path, host: str, state_dir: Path, credentials_project: Path | None = None) -> str:
     config = read_host(manifest, host)
     if config.hold:
@@ -456,7 +528,8 @@ def reconcile(factory: Path, consumer_root: Path, host_setup: Path, manifest: Pa
     if status["selectedMatches"]:
         # The consumer gate protects the switch; once the host runs the pin it
         # has nothing to wait for, and a tick must not open PRs for a done host.
-        return "host-converged"
+        # What remains is retiring the previous Xcode once delivery is green.
+        return retire_if_validated(config, factory, credentials_project, manifest, host, consumer_root, status)
     # The hold comes before the consumer step, so a held pin opens no consumer
     # PR and spends no agent runs.
     if config.pin.phase == "stage":
@@ -468,7 +541,7 @@ def reconcile(factory: Path, consumer_root: Path, host_setup: Path, manifest: Pa
     status = host_status(factory, manifest, host)
     if not status["selectedMatches"]:
         return "waiting-host-promotion"
-    return "host-converged"
+    return retire_if_validated(config, factory, credentials_project, manifest, host, consumer_root, status)
 
 
 def resolve_paths(args: argparse.Namespace, config: HostConfig) -> tuple[Path, Path, Path]:
