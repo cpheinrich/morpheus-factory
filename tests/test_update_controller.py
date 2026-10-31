@@ -94,7 +94,7 @@ class UpdateControllerTests(unittest.TestCase):
 
     def test_promotion_validates_before_switch(self):
         calls = []
-        with patch.object(controller, "report", return_value={"selected": "/Applications/Xcode.app/Contents/Developer", "selectedMatches": False}), \
+        with patch.object(controller, "host_is_busy", return_value=False), patch.object(controller, "report", return_value={"selected": "/Applications/Xcode.app/Contents/Developer", "selectedMatches": False}), \
              patch.object(controller, "stage", side_effect=lambda *a: calls.append("stage")), \
              patch.object(controller, "validate", side_effect=lambda *a: calls.append("validate")), \
              patch.object(controller, "activate", side_effect=lambda *a: calls.append("activate")):
@@ -114,7 +114,7 @@ class UpdateControllerTests(unittest.TestCase):
         activate.assert_not_called()
 
     def test_failed_validation_does_not_switch(self):
-        with patch.object(controller, "report", return_value={"selected": "/Applications/Xcode.app/Contents/Developer", "selectedMatches": False}), \
+        with patch.object(controller, "host_is_busy", return_value=False), patch.object(controller, "report", return_value={"selected": "/Applications/Xcode.app/Contents/Developer", "selectedMatches": False}), \
              patch.object(controller, "stage"), \
              patch.object(controller, "validate", side_effect=controller.UpdateError("failed")), \
              patch.object(controller, "activate") as activate:
