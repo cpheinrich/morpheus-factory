@@ -756,6 +756,31 @@ def version_key(version):
     return tuple(int(part) for part in version.split("."))
 
 
+def removable_by_caller(app):
+    """A hand-installed bundle the caller can delete without root: the caller
+    owns it and can unlink it from /Applications."""
+    return app.lstat().st_uid == os.getuid() and os.access(app.parent, os.W_OK)
+
+
+def remove_app(app):
+    """Remove one Xcode bundle: Factory installs through the root helper, a
+    hand-installed /Applications/Xcode.app directly, since the caller owns it."""
+    if app.name != "Xcode.app":
+        root_helper("remove", app)
+        return
+    # Set it aside first: a delete that fails part-way (App Management, a
+    # root-owned file inside) then leaves a visibly half-removed bundle, not an
+    # Xcode.app whose xcodebuild is gone and which no later prune would see.
+    aside = app.with_name("Xcode.app.removing")
+    if aside.exists():
+        raise UpdateError(f"{aside} is left from an earlier removal; remove it by hand")
+    try:
+        app.rename(aside)
+        shutil.rmtree(aside)
+    except OSError as error:
+        raise UpdateError(f"could not remove {app} (see {aside}): {error.strerror}") from error
+
+
 def prune(version, build, retain, previous=None, window=False):
     """Keep `retain` Xcode bundles: protected ones first, then the newest others.
 
@@ -764,6 +789,9 @@ def prune(version, build, retain, previous=None, window=False):
     /Applications/Xcode.app symlink. During the migration window (`window`:
     promoted but not yet validated) at least two bundles stay, so the previous
     Xcode survives until delivery is green whatever `retain` says.
+    A hand-installed /Applications/Xcode.app (a real directory, not a symlink)
+    is a bundle like any other once Xcode identifies it: one Xcode per host
+    (Chris, 2026-10-31) applies to the app the host had before Factory too.
     Returns the removed paths, or None when the host is busy and nothing was
     considered, so a caller can tell "nothing to remove" from "not now".
     """
@@ -794,10 +822,21 @@ def prune(version, build, retain, previous=None, window=False):
         # Only a bundle Xcode itself identifies is ours to remove.
         if identity is not None:
             candidates.append((version_key(match.group(1)), app))
+    # The root helper removes only Factory's versioned bundles, so a plain
+    # Xcode.app is a candidate only when the caller can delete it: one owned
+    # by root (an App Store install) stays, for removal by hand, rather than
+    # failing every later reconcile.
+    if plain.is_dir() and not plain.is_symlink() and plain.resolve() not in protected and removable_by_caller(plain):
+        try:
+            identity = installed_build(plain)
+        except UpdateError:
+            identity = None
+        if identity is not None and re.fullmatch(r"[0-9]+(\.[0-9]+)*", identity[0]):
+            candidates.append((version_key(identity[0]), plain))
     candidates.sort(reverse=True)
     removed = []
     for _, app in candidates[max(0, retain - len(protected)):]:
-        root_helper("remove", app)
+        remove_app(app)
         removed.append(str(app))
     return removed
 
