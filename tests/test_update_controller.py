@@ -286,7 +286,7 @@ class UpdateControllerTests(unittest.TestCase):
             "FACTORY_VERIFICATION_CODE_TOKEN": "broker-secret",
             "ZOE_APPLE_ID_PASSWORD": "apple-secret",
             "ASC_ISSUER_ID": "other-secret",
-        }), patch.object(controller.subprocess, "run", return_value=Result()) as child:
+        }), patch.object(controller.subprocess, "run", return_value=Result()) as child, patch.object(controller.time, "time", return_value=100.0):
             self.assertEqual(controller.request_verification_code(verification, 100.0, 120, 6), "123456")
         sent = json.loads(child.call_args.kwargs["input"])
         self.assertEqual(sent, {"purpose": "apple-developer", "account": "zoe-apple-developer", "challengeStartedAt": 100.0, "timeoutSeconds": 120})
@@ -294,6 +294,37 @@ class UpdateControllerTests(unittest.TestCase):
         self.assertEqual(passed["FACTORY_VERIFICATION_CODE_TOKEN"], "broker-secret")
         self.assertNotIn("ZOE_APPLE_ID_PASSWORD", passed)
         self.assertNotIn("ASC_ISSUER_ID", passed)
+
+    def test_one_sms_per_wait_window_even_when_the_provider_answers_at_once(self):
+        # The Pro, 2026-10-31: an unauthorized caller made the provider exit 75 immediately and the
+        # controller asked Apple for a new code three times within a minute.
+        clock = [100.0]
+        def now(): return clock[0]
+        def sleep(seconds): clock[0] += seconds
+        attempts = []
+        def provider(argv, **kwargs):
+            attempts.append(json.loads(kwargs["input"])["timeoutSeconds"])
+            return SimpleNamespace(returncode=75, stdout="", stderr="verification code unavailable")
+        verification = {"purpose": "p", "account": "a"}
+        with patch.dict(os.environ, {"FACTORY_VERIFICATION_CODE_COMMAND": "/usr/bin/true"}), \
+             patch.object(controller.subprocess, "run", side_effect=provider), \
+             patch.object(controller.time, "time", side_effect=now), patch.object(controller.time, "sleep", side_effect=sleep):
+            with self.assertRaises(controller.CodeTimeout):
+                controller.request_verification_code(verification, 100.0, 120, 6)
+        # Re-asked every 10 s across the whole 120 s window; the window itself never shortened below the deadline.
+        self.assertGreaterEqual(len(attempts), 12)
+        self.assertEqual(clock[0], 220.0)
+        self.assertEqual(attempts[0], 120)
+
+    def test_provider_refusal_stops_without_a_resend(self):
+        verification = {"purpose": "p", "account": "a"}
+        refused = SimpleNamespace(returncode=78, stdout="", stderr="refused")
+        with patch.dict(os.environ, {"FACTORY_VERIFICATION_CODE_COMMAND": "/usr/bin/true"}), \
+             patch.object(controller.subprocess, "run", return_value=refused) as child, \
+             patch.object(controller.time, "time", return_value=100.0):
+            with self.assertRaisesRegex(controller.UpdateError, "refused this host"):
+                controller.request_verification_code(verification, 100.0, 120, 6)
+        self.assertEqual(child.call_count, 1)
 
     def test_late_code_remains_eligible_after_sms_resend(self):
         temporary = tempfile.TemporaryDirectory()
@@ -567,6 +598,7 @@ class FakeHost:
             device_record(UDID.lower(), "connected", "wired"),
             device_record("00008150-0015741E3AEA401C", "disconnected", "localNetwork", name="Other iPhone")]}}
         self.gh = (0, "")
+        self.provider = 75  # the provider probe's exit: 75 no code yet, 78 refused
         self.env = {"ZOE_APPLE_ID": "user@example.test", "ZOE_APPLE_ID_PASSWORD": "secret",
                     "FACTORY_VERIFICATION_CODE_COMMAND": sys.executable,
                     "FACTORY_VERIFICATION_CODE_URL": "https://broker.example.test", "USER": "chris"}
@@ -599,6 +631,8 @@ class FakeHost:
 
     def gh_run(self, argv, **kwargs):
         self.commands.append(argv)
+        if argv == [sys.executable]:  # the verification-code provider probe
+            return SimpleNamespace(returncode=self.provider, stdout="", stderr="verification code unavailable")
         code, stderr = self.gh
         return SimpleNamespace(returncode=code, stdout="secret-body", stderr=stderr)
 
@@ -692,6 +726,20 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(self.failing(host), ["apple-credentials"])
         self.assertEqual(checks["apple-credentials"]["detail"], "missing or empty: ZOE_APPLE_ID_PASSWORD")
         self.assertNotIn("user@example.test", json.dumps(checks))
+
+    def test_provider_probe_distinguishes_refusal_from_no_code(self):
+        host = FakeHost(self)
+        host.provider = 75
+        self.assertTrue(host.checks()["verification-provider"]["ok"])
+        host.provider = 0
+        self.assertTrue(host.checks()["verification-provider"]["ok"])
+        host.provider = 78
+        self.assertEqual(self.failing(host), ["verification-provider"])
+        self.assertIn("enrol it with the SMS broker", host.checks()["verification-provider"]["detail"])
+        host.provider = 1
+        self.assertIn("probe exited 1", host.checks()["verification-provider"]["detail"])
+        probe = [argv for argv in host.commands if argv == [sys.executable]]
+        self.assertTrue(probe)
 
     def test_provider_requires_https(self):
         host = FakeHost(self)

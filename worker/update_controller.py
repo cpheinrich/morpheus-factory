@@ -368,28 +368,43 @@ def xcodes_environment(apple=None):
 
 
 def request_verification_code(verification, started_at, timeout_seconds, length):
-    """Ask a host-installed provider for one code without logging its output."""
+    """Ask a host-installed provider for one code without logging its output.
+
+    One SMS per wait window: the provider is asked again every few seconds until
+    the window that began at started_at has elapsed, so a provider that answers
+    "no code" at once (the Pro, 2026-10-31: an unauthorized caller) cannot make
+    the caller request a new code early. Exit 75 is "no code yet"; exit 78 is a
+    refusal (bad token or configuration) and stops the run without a resend.
+    """
     executable = os.environ.get("FACTORY_VERIFICATION_CODE_COMMAND", "")
     if not executable or not Path(executable).is_absolute() or not os.access(executable, os.X_OK):
         raise UpdateError("verification-code provider is not configured as an executable absolute path")
     env = {key: os.environ[key] for key in ("HOME", "PATH", "TMPDIR", "LANG", "USER", "LOGNAME", "FACTORY_VERIFICATION_CODE_URL", "FACTORY_VERIFICATION_CODE_TOKEN") if key in os.environ}
-    request = {"purpose": verification["purpose"], "account": verification["account"], "challengeStartedAt": started_at, "timeoutSeconds": timeout_seconds}
-    try:
-        result = subprocess.run([executable], input=json.dumps(request), text=True, capture_output=True, env=env, check=False, timeout=timeout_seconds + 10)
-    except subprocess.TimeoutExpired as error:
-        raise CodeTimeout("verification-code provider timed out") from error
-    if result.returncode == 75:
-        raise CodeTimeout("verification code did not arrive")
-    if result.returncode:
-        raise UpdateError("verification-code provider failed")
-    try:
-        response = json.loads(result.stdout)
-        code = response["code"]
-    except (ValueError, KeyError, TypeError) as error:
-        raise UpdateError("verification-code provider returned an invalid response") from error
-    if not isinstance(code, str) or not CODE.fullmatch(code) or len(code) != length:
-        raise UpdateError("verification-code provider returned an invalid code length")
-    return code
+    deadline = (started_at or time.time()) + timeout_seconds
+    while True:
+        remaining = max(1, int(deadline - time.time()))
+        request = {"purpose": verification["purpose"], "account": verification["account"], "challengeStartedAt": started_at, "timeoutSeconds": remaining}
+        try:
+            result = subprocess.run([executable], input=json.dumps(request), text=True, capture_output=True, env=env, check=False, timeout=remaining + 10)
+        except subprocess.TimeoutExpired as error:
+            raise CodeTimeout("verification-code provider timed out") from error
+        if result.returncode == 78:
+            raise UpdateError("verification-code provider refused this host (enrol it with the broker)")
+        if result.returncode == 75:
+            if time.time() >= deadline:
+                raise CodeTimeout("verification code did not arrive")
+            time.sleep(min(10, max(1, deadline - time.time())))
+            continue
+        if result.returncode:
+            raise UpdateError("verification-code provider failed")
+        try:
+            response = json.loads(result.stdout)
+            code = response["code"]
+        except (ValueError, KeyError, TypeError) as error:
+            raise UpdateError("verification-code provider returned an invalid response") from error
+        if not isinstance(code, str) or not CODE.fullmatch(code) or len(code) != length:
+            raise UpdateError("verification-code provider returned an invalid code length")
+        return code
 
 
 def _answer_hidden_prompt(master, line, timeout=5.0):
@@ -876,7 +891,22 @@ def check_provider(pin):
         problems.append("FACTORY_VERIFICATION_CODE_COMMAND is not an executable absolute path")
     if not url.startswith("https://"):
         problems.append("FACTORY_VERIFICATION_CODE_URL is not https")
-    return (False, "; ".join(problems)) if problems else (True, "verification-code provider configured")
+    if problems:
+        return False, "; ".join(problems)
+    # A one-second dry request proves the broker accepts this host's token
+    # before any Apple login spends an SMS: 75 (no code yet) and 0 are fine,
+    # 78 is a refusal (the host is not enrolled), anything else is a failure.
+    env = {key: os.environ[key] for key in ("HOME", "PATH", "TMPDIR", "LANG", "USER", "LOGNAME", "FACTORY_VERIFICATION_CODE_URL", "FACTORY_VERIFICATION_CODE_TOKEN") if key in os.environ}
+    request = {"purpose": pin.verification["purpose"], "account": pin.verification["account"], "challengeStartedAt": int(time.time()) - 60, "timeoutSeconds": 1}
+    try:
+        probe = subprocess.run([command], input=json.dumps(request), text=True, capture_output=True, env=env, check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False, "verification-code provider did not answer a one-second probe"
+    if probe.returncode in (0, 75):
+        return True, "verification-code provider configured and the broker accepts this host"
+    if probe.returncode == 78:
+        return False, "verification-code provider refused this host; enrol it with the SMS broker (zoe/sms/enroll-host.py)"
+    return False, f"verification-code provider probe exited {probe.returncode}"
 
 
 def check_paths(pin):
