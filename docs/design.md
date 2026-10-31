@@ -240,6 +240,19 @@ recorded with its actual output.
   (proven on the Pro on 2026-10-30). Factory writes its own plist without it.
   Evo's restricted device runner keeps its installer in agent-host-setup; Factory
   only checks its plist.
+- *Root actions go through one Apple-signature-checking helper, not a sudoers
+  list of commands.* The first draft granted `/bin/mv`, `/bin/rm -rf --
+  /Applications/Xcode_*.app` and `xcode-select --switch *` without a password.
+  Independent review showed that is root for any process running as the worker
+  user: a bare `mv` writes anywhere, sudoers matches `*` across the whole
+  argument string, and `/Applications` is admin-writable, so a wildcard
+  `xcodebuild` path would run a planted binary as root. The host keeps one
+  root-owned helper (`worker/xcode-root-helper.sh`, installed once to
+  `/usr/local/libexec/morpheus-factory-xcode`) with three verbs that validate
+  the app path and require `spctl` to accept the bundle before `xcode-select`,
+  `-license accept`, `-runFirstLaunch` or removal run as root. The move into
+  `/Applications` needs no root at all. `check` reports a missing, stale or
+  writable helper.
 - *`xcodes` is installed from its pinned, checksummed release binary.* The
   Homebrew tap compiles it from source and fails on macOS 27 (observed on the
   Air; XcodesOrg/homebrew-made#4). One audited version and checksum in
