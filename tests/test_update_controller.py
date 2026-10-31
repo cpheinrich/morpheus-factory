@@ -504,7 +504,7 @@ class ManifestFieldTests(unittest.TestCase):
         self.assertEqual((zoe.role, zoe.phase, zoe.apple["idVar"]), ("ci-image", "promote", "ZOE_APPLE_ID"))
         self.assertEqual(zoe.paths["hostSetup"], "/Users/zoe/code/agent-host-setup")
         pro = controller.pin_for_host(manifest, "christophers-macbook-pro")
-        self.assertEqual((pro.role, pro.phase, pro.version, pro.build), ("phone-gate", "stage", "27.2", "27B52"))
+        self.assertEqual((pro.role, pro.phase, pro.version, pro.build), ("phone-gate", "promote", "27.2", "27B52"))
         self.assertEqual(pro.runner, {"label": "actions.runner.darwin-health.evo-cd-mbp-device",
                                       "dir": "/Users/chrisheinrich/actions-runner-evo-cd-mbp-device",
                                       "requiredEnv": ["MORPHEUS_CREDENTIALS_REPO"], "organization": "darwin-health"})
