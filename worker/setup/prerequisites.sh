@@ -8,10 +8,11 @@ xcode-select -p >/dev/null 2>&1 || {
 }
 echo "macOS and command-line tools ready"
 if ((WORKER_CHECK_ONLY)); then
-  # Report only: the sudoers rule needs a password, so the operator adds it once.
-  if sudo -n true 2>/dev/null; then
-    echo "sudo -n: ready"
+  # Report only: installing the root helper needs a password, so the operator does it once.
+  helper=/usr/local/libexec/morpheus-factory-xcode
+  if [[ -x "$helper" ]] && sudo -n -l "$helper" >/dev/null 2>&1; then
+    echo "root helper: $helper installed and allowed"
   else
-    echo "sudo -n: password required — Xcode staging and activation need passwordless sudo for exact commands; see docs/host-updates.md"
+    echo "root helper: missing or not allowed — Xcode activation and first launch need it; see docs/host-updates.md"
   fi
 fi

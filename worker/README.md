@@ -7,8 +7,8 @@ rerunnable, and `--check` reports local readiness without changing the host.
 
 | Stage | Responsibility |
 | --- | --- |
-| `prerequisites.sh` | Check macOS, login user and Apple command-line tools; `--check` also reports whether `sudo -n` works, which Xcode staging and activation need for their exact commands (the operator adds that sudoers rule once; see `docs/host-updates.md`). |
-| `apps.sh` | Remove iMovie, GarageBand, Keynote, Pages and Numbers after verifying their Apple bundle IDs; remove orphaned GarageBand audio content when no compatible app remains. |
+| `prerequisites.sh` | Check macOS, login user and Apple command-line tools; `--check` also reports whether the root helper `/usr/local/libexec/morpheus-factory-xcode` is installed and allowed by sudoers (the operator installs it once; see `docs/host-updates.md`). |
+| `apps.sh` | Remove iMovie, GarageBand, Keynote, Pages and Numbers after verifying their Apple bundle IDs, when `sudo -n` allows it (they are root-owned); otherwise report and leave them. Remove orphaned GarageBand audio content when no compatible app remains. |
 | `tools.sh` | Install Git, Node, pnpm and gh through Homebrew when missing; install `xcodes` 2.1.0 to `~/.local/bin` from the publisher's checksummed release binary (the Homebrew tap builds from source and fails on macOS 27); require `python3` from the command-line tools. |
 | `source.sh` | Clone Morpheus without resetting an existing checkout. |
 | `morpheus.sh` | Install the copied Morpheus CLI when missing; the watchdog uses its guarded worktree cleanup. |

@@ -10,11 +10,13 @@ apps=(
   'Numbers:com.apple.iWork.Numbers'
 )
 
-# Removal needs passwordless sudo. Without it the host still works; report and move on.
+# Apple's bundled apps are root-owned, so removal needs root. Factory's only
+# passwordless root grant is the Xcode helper, so without a wider sudo rule the
+# host still works and the apps stay; report and move on.
 can_sudo=1
-if ! ((WORKER_CHECK_ONLY)) && ! sudo -n true 2>/dev/null; then
+if ! ((WORKER_CHECK_ONLY)) && ! sudo -n /usr/bin/true 2>/dev/null; then
   can_sudo=0
-  echo "sudo -n is unavailable; unused Apple apps are left in place (see docs/host-updates.md for the sudoers line)"
+  echo "sudo -n is unavailable; unused Apple apps are left in place (remove by hand: sudo rm -rf /Applications/<App>.app)"
 fi
 
 for entry in "${apps[@]}"; do
