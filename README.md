@@ -133,7 +133,10 @@ check out Morpheus, exclude development roots from Spotlight, and install the
 guarded old-worktree cleanup, installed-app installer removal and a 5 GiB SwiftPM cache threshold.
 The watchdog starts pressure cleanup below the greater of 50 GiB or 15% free space.
 Use `--check` to inspect
-the host without changing it. This is the first stage of the single-command
+the host without changing it. Hosts that serve CI/CD register a persistent
+Actions runner with `worker/runner.sh`, whose Factory-owned LaunchAgent never
+sets `SessionCreate` (the stock service plist does, and it locks the signing
+keychain). This is the first stage of the single-command
 worker setup: fleet activation still needs broker configuration, provider CLIs
 and the Morpheus execution adapter.
 
@@ -143,5 +146,9 @@ and the Morpheus execution adapter.
 reconciler. It pins exact version and build, stages the approved app beside the
 current one, and validates before changing `xcode-select`. The
 [`fleet controller`](fleet/README.md) carries a reviewed pin through the Tart
-image, Evo CI, and host promotion. The hourly LaunchAgent fast-forwards a clean
-Factory checkout before reconciling the reviewed manifest.
+image, a deterministic draft PR on Evo, and host promotion; a fresh, capped
+agent runs only when that PR cannot merge by itself. `update_controller.py check`
+refuses before any download when sudo rights, credentials, disk, a runner
+LaunchAgent, signing identities or the paired phone are wrong. The hourly
+LaunchAgent fast-forwards a clean Factory checkout before reconciling the
+reviewed manifest.

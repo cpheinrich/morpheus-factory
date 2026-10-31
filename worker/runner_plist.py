@@ -48,7 +48,7 @@ def render(name, runner_dir, log_dir):
         "RunAtLoad": True,
         "KeepAlive": True,
         "ProcessType": "Interactive",
-        "EnvironmentVariables": {"PATH": RUNNER_PATH},
+        "EnvironmentVariables": {"PATH": RUNNER_PATH, "ACTIONS_RUNNER_SVC": "1"},
         "StandardOutPath": f"{logs}/stdout.log",
         "StandardErrorPath": f"{logs}/stderr.log",
     }

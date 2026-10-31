@@ -23,7 +23,11 @@ a `ci-image` role without `ci` (or the reverse) is refused.
 3. Require **merged consumer main** to carry the pin: every `xcode-version:` and
    every `xcode-<X>` runner label in `.github/workflows/*.yml` equals the pin,
    at least one workflow sets `xcode-version:`, and the assertion script names
-   `Xcode <version>` and `Build version <build>`. No workflow names are listed.
+   `Xcode <version>` and `Build version <build>`. No workflow names are listed;
+   `consumer.ignorePaths` names lanes the consumer keeps on an older Xcode on
+   purpose (Evo's `cd-v2-*.yml` until its deletion), which are neither judged
+   nor rewritten. A host that already selects the pin reports `host-converged`
+   without touching the consumer: the gate protects the switch, not the past.
 4. If `phase` is `"stage"`, hold (`held-at-stage`). `"promote"` or absent goes on.
 5. Run the host reconciler (validate with `DEVELOPER_DIR`, switch `xcode-select`,
    roll back a failed switch) and report `host-converged` once it is selected.
@@ -55,11 +59,14 @@ Results: `waiting-host-stage`, `waiting-consumer-pr`, `waiting-consumer-merge`,
 "consumer": {
   "repository": "darwin-health/evo",
   "assertion": "apps/ios/scripts/ci/assert-xcode-build.sh",
-  "pinPaths": [".github/workflows/*.yml", "apps/ios/scripts/ci/assert-xcode-build.sh"]
+  "pinPaths": [".github/workflows/*.yml", "apps/ios/scripts/ci/assert-xcode-build.sh"],
+  "ignorePaths": [".github/workflows/cd-v2-*.yml"]
 }
 ```
 
-Optional and top-level; those are the defaults. Paths must be relative with no
+Optional and top-level; those are the defaults except `ignorePaths`, which
+defaults to none and is set in the reviewed manifest while Evo's CD V2 lane
+still exists. Paths must be relative with no
 `..`. Each host may set `paths.consumer`, `paths.hostSetup` and
 `paths.credentialsProject` (absolute); `--consumer-root` (alias `--evo-root`),
 `--host-setup-root` and `--credentials-project` override them.

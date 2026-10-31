@@ -156,6 +156,25 @@ class ConsumerPinTests(unittest.TestCase):
         files.pop(ASSERTION)
         self.assertIs(self.check(files)[0], False)
 
+    def test_ignored_transitional_lane_is_not_judged(self):
+        files = pinned_files()
+        files[".github/workflows/cd-v2-delivery.yml"] = "jobs:\n  build:\n    runs-on: macos-vm\n    with:\n      xcode-version: '26.6'\n"
+        self.assertIs(self.check(files)[0], False)
+        consumer = controller.Consumer(ignore_paths=(".github/workflows/cd-v2-*.yml",))
+        repo = FakeRepo(files)
+        command, git_file = repo.patches()
+        with command, git_file:
+            self.assertIs(controller.consumer_has_pin(Path("/evo"), PIN, consumer), True)
+
+    def test_real_assertion_shape_with_literal_newline_escape(self):
+        # Evo's script compares against $'Xcode 27.2\nBuild version 27B52': "\n" is two literal characters.
+        files = pinned_files()
+        files[ASSERTION] = "[[ \"$identity\" == $'Xcode 27.2\\nBuild version 27B52' ]] || exit 1\n"
+        self.assertIs(self.check(files)[0], True)
+        self.assertEqual(controller.assertion_pin(files[ASSERTION]), ("27.2", "27B52"))
+        rewritten = controller.substitute_pin(files[ASSERTION], ("27.2", "27B52"), controller.Pin("27.3", "27C5", "promote"))
+        self.assertEqual(rewritten, "[[ \"$identity\" == $'Xcode 27.3\\nBuild version 27C5' ]] || exit 1\n")
+
     def test_no_workflow_mentions_xcode_version_fails(self):
         files = pinned_files()
         files[".github/workflows/ios-delivery.yml"] = "jobs:\n  test:\n    runs-on: xcode-27.2\n"
@@ -189,6 +208,15 @@ class SubstitutionTests(unittest.TestCase):
             (root / "a.yml").write_text("runs-on: ubuntu-latest\n")
             with self.assertRaisesRegex(controller.FleetError, "changed nothing"):
                 controller.rewrite_pin_files(root, {"a.yml"}, ("*.yml",), ("26.6", "26F12"), PIN)
+
+    def test_ignored_files_are_not_rewritten(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "a.yml").write_text("xcode-version: '26.6'\n")
+            (root / "cd-v2-delivery.yml").write_text("xcode-version: '26.6'\n")
+            ignores = controller.Consumer(ignore_paths=("cd-v2-*.yml",)).ignores
+            self.assertEqual(controller.rewrite_pin_files(root, {"a.yml", "cd-v2-delivery.yml"}, ("*.yml",), ("26.6", "26F12"), PIN, ignores), ["a.yml"])
+            self.assertEqual((root / "cd-v2-delivery.yml").read_text(), "xcode-version: '26.6'\n")
 
     def test_only_tracked_files_are_rewritten(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -291,6 +319,12 @@ class ReconcileTests(unittest.TestCase):
                                             status=[{"installedMatches": True, "selectedMatches": False}, {"installedMatches": True, "selectedMatches": False}],
                                             pinned=[True])
         self.assertEqual((result, events), ("waiting-host-promotion", ["reconcile"]))
+
+    def test_converged_host_never_touches_the_consumer(self):
+        # Evo's V2 lane sits on 26.6 on purpose; a host already on the pin must not open PRs over it.
+        result, events = self.run_reconcile({"xcode": {"version": "27.2", "build": "27B52", "phase": "promote"}, "ci": CI},
+                                            status={"installedMatches": True, "selectedMatches": True}, pinned=[False])
+        self.assertEqual((result, events), ("host-converged", ["sync-tools", "image-stage"]))
 
     def test_stage_phase_holds_after_consumer_pin(self):
         result, events = self.run_reconcile({"xcode": {"version": "27.2", "build": "27B52", "phase": "stage"}, "ci": CI},

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import fnmatch
 import json
 import os
 import re
@@ -62,6 +63,12 @@ class Consumer:
     repository: str = "darwin-health/evo"
     assertion: str = DEFAULT_ASSERTION
     pin_paths: tuple[str, ...] = (WORKFLOW_DIR + "*.yml", DEFAULT_ASSERTION)
+    # Transitional lanes the consumer keeps on an older Xcode on purpose; they
+    # are neither judged nor rewritten. Remove entries when the files go.
+    ignore_paths: tuple[str, ...] = ()
+
+    def ignores(self, path: str) -> bool:
+        return any(fnmatch.fnmatch(path, pattern) for pattern in self.ignore_paths)
 
 
 @dataclass(frozen=True)
@@ -93,7 +100,11 @@ def read_consumer(data: dict) -> Consumer:
     pin_paths = raw.get("pinPaths", list(default.pin_paths))
     if not isinstance(pin_paths, list) or not pin_paths:
         raise FleetError("consumer pinPaths must be a non-empty list")
-    return Consumer(repository, assertion, tuple(_relative_path(path) for path in pin_paths))
+    ignore_paths = raw.get("ignorePaths", [])
+    if not isinstance(ignore_paths, list):
+        raise FleetError("consumer ignorePaths must be a list")
+    return Consumer(repository, assertion, tuple(_relative_path(path) for path in pin_paths),
+                    tuple(_relative_path(path) for path in ignore_paths))
 
 
 def read_host(manifest: Path, host: str) -> HostConfig:
@@ -139,7 +150,7 @@ def consumer_has_pin(root: Path, pin: Pin, consumer: Consumer) -> bool:
     listing = command(["git", "-C", str(root), "ls-tree", "--name-only", "origin/main", WORKFLOW_DIR])
     pinned_somewhere = False
     for path in (line.strip() for line in listing.splitlines()):
-        if not path.endswith(".yml"):
+        if not path.endswith(".yml") or consumer.ignores(path):
             continue
         body = git_file(root, "origin/main", path)
         versions = XCODE_VERSION_VALUE.findall(body)
@@ -160,8 +171,10 @@ def consumer_has_pin(root: Path, pin: Pin, consumer: Consumer) -> bool:
 
 
 def assertion_pin(assertion: str) -> tuple[str, str]:
-    version = re.search(r"\bXcode ([0-9]+(?:\.[0-9]+){1,2})" + VERSION_END, assertion)
-    build = re.search(r"\bBuild version ([A-Za-z0-9]+)\b", assertion)
+    # The script compares against $'Xcode 27.2\nBuild version 27B52': the literal
+    # backslash-n before "Build" means no word boundary precedes it.
+    version = re.search(r"(?<![\w/])Xcode ([0-9]+(?:\.[0-9]+){1,2})" + VERSION_END, assertion)
+    build = re.search(r"Build version ([A-Za-z0-9]+)(?![A-Za-z0-9])", assertion)
     if not version or not build:
         raise FleetError("cannot read the current Xcode version and build from the consumer assertion")
     return version.group(1), build.group(1)
@@ -172,16 +185,17 @@ def substitute_pin(text: str, old: tuple[str, str], new: Pin) -> str:
     text = re.sub(r"(xcode-version:\s*['\"]?)" + old_version + VERSION_END, lambda m: m.group(1) + new.version, text)
     text = re.sub(r"(?<![\w-])xcode-" + old_version + VERSION_END, "xcode-" + new.version, text)
     text = re.sub(r"\bXcode_" + old_version + r"\.app", f"Xcode_{new.version}.app", text)
-    text = re.sub(r"\bXcode " + old_version + VERSION_END, "Xcode " + new.version, text)
-    text = re.sub(r"\bBuild version " + old_build + r"\b", "Build version " + new.build, text)
+    text = re.sub(r"(?<![\w/])Xcode " + old_version + VERSION_END, "Xcode " + new.version, text)
+    text = re.sub(r"Build version " + old_build + r"(?![A-Za-z0-9])", "Build version " + new.build, text)
     return re.sub(r"\b" + old_build + r"\b", new.build, text)
 
 
-def rewrite_pin_files(worktree: Path, tracked: set[str], patterns: tuple[str, ...], old: tuple[str, str], new: Pin) -> list[str]:
+def rewrite_pin_files(worktree: Path, tracked: set[str], patterns: tuple[str, ...], old: tuple[str, str], new: Pin,
+                      consumer_ignores=lambda path: False) -> list[str]:
     changed = []
     candidates = sorted({path.relative_to(worktree).as_posix() for pattern in patterns for path in worktree.glob(pattern) if path.is_file()})
     for relative in candidates:
-        if relative not in tracked:
+        if relative not in tracked or consumer_ignores(relative):
             continue
         path = worktree / relative
         before = path.read_text()
@@ -206,7 +220,7 @@ def open_pin_pr(root: Path, pin: Pin, consumer: Consumer) -> str:
     try:
         command(["git", "-C", str(root), "worktree", "add", "--detach", str(worktree), "origin/main"])
         tracked = set(command(["git", "-C", str(worktree), "ls-files"]).splitlines())
-        changed = rewrite_pin_files(worktree, tracked, consumer.pin_paths, old, pin)
+        changed = rewrite_pin_files(worktree, tracked, consumer.pin_paths, old, pin, consumer.ignores)
         command(["git", "-C", str(worktree), "checkout", "-B", branch])
         command(["git", "-C", str(worktree), "add", "--", *changed])
         command(["git", "-C", str(worktree), "-c", "user.name=morpheus-factory", "-c", "user.email=noreply@github.com",
@@ -363,6 +377,10 @@ def reconcile(factory: Path, consumer_root: Path, host_setup: Path, manifest: Pa
         # The host-side command verifies the exact guest build and activates the
         # repo-specific runner pool as one idempotent transaction.
         host_action(factory, credentials_project, manifest, host, "image-stage")
+    if status["selectedMatches"]:
+        # The consumer gate protects the switch; once the host runs the pin it
+        # has nothing to wait for, and a tick must not open PRs for a done host.
+        return "host-converged"
     waiting = advance_consumer(config, factory, consumer_root, state_dir / "fleet.json")
     if waiting:
         return waiting

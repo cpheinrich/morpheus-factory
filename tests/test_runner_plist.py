@@ -36,7 +36,7 @@ class RenderTests(unittest.TestCase):
             plist["StandardErrorPath"],
             f"{LOG_DIR}/com.morpheus-factory.runner.mbp/stderr.log",
         )
-        self.assertEqual(plist["EnvironmentVariables"], {"PATH": runner_plist.RUNNER_PATH})
+        self.assertEqual(plist["EnvironmentVariables"], {"PATH": runner_plist.RUNNER_PATH, "ACTIONS_RUNNER_SVC": "1"})
 
     def test_requires_absolute_paths(self):
         with self.assertRaises(ValueError):
