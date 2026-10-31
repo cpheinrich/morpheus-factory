@@ -338,11 +338,14 @@ bundles (Factory's `/Applications/Xcode_<version>.app`, compared numerically, an
 a hand-installed `/Applications/Xcode.app` ordered by the version it reports),
 and removes the rest, listing them under `removed`. Factory's bundles go through
 the helper's `remove`; a hand-installed `Xcode.app` is a real directory the user
-owns, so it is removed directly, and one owned by root makes `retire` refuse
-before removing anything (`sudo rm -rf` by hand). One Xcode per host (Chris,
-2026-10-31) covers the app the host had before Factory: on the MacBook Pro and
-Air the previous Xcode is exactly that plain bundle. Pruning only considers
-bundles whose `xcodebuild -version` it can read and does nothing on a busy host.
+owns, so it is renamed to `Xcode.app.removing` and deleted as the user (a delete
+that fails part-way leaves that name behind, to finish by hand). One the user
+cannot delete, owned by root as an App Store install is, or whose reported
+version is not numeric, is never a candidate and stays for removal by hand, so
+no reconcile fails over it. One Xcode per host (Chris, 2026-10-31) covers the app
+the host had before Factory: on the MacBook Pro and Air the previous Xcode is
+exactly that plain bundle. Pruning only considers bundles whose
+`xcodebuild -version` it can read and does nothing on a busy host.
 
 **Validated** means three facts, judged by the [fleet coordinator](../fleet/README.md#retiring-the-previous-xcode):
 the host selects the pin, the consumer's merged main carries the pin, and the

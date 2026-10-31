@@ -1099,10 +1099,43 @@ class PruneTests(unittest.TestCase):
     def test_hand_installed_xcode_survives_the_migration_window(self):
         self.assertEqual(self.prune(["27.2"], 1, extra=["Xcode.app"], window=True), [])
 
-    def test_hand_installed_xcode_owned_by_root_refuses_before_removing_anything(self):
-        with patch.object(controller, "owned_by_caller", return_value=False):
-            with self.assertRaisesRegex(controller.UpdateError, "not owned by this user; remove it by hand"):
-                self.prune(["27.2", "27.0"], 1, extra=["Xcode.app"])
+    def test_hand_installed_xcode_the_caller_cannot_delete_is_left_alone(self):
+        # A root-owned Xcode.app (an App Store install) is not a candidate: the
+        # other surplus still goes, and no reconcile fails over it.
+        with patch.object(controller, "removable_by_caller", return_value=False):
+            self.assertEqual(self.prune(["27.2", "27.0"], 1, extra=["Xcode.app"]), ["Xcode_27.0.app"])
+
+    def test_hand_installed_xcode_with_a_non_numeric_version_is_left_alone(self):
+        def identity(app):
+            return ("26.0 beta", "23A5001") if app.name == "Xcode.app" else ("x", "y")
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        applications = Path(temporary.name).resolve()
+        for name in ("Xcode_27.2.app", "Xcode.app"):
+            (applications / name).mkdir()
+        current = {"selectedMatches": True, "selected": str(applications / "Xcode_27.2.app/Contents/Developer")}
+        with patch.object(controller, "APPLICATIONS", applications), patch.object(controller, "installed_build", side_effect=identity), \
+             patch.object(controller, "report", return_value=current), patch.object(controller, "host_is_busy", return_value=False), \
+             patch.object(controller, "root_helper") as helper:
+            self.assertEqual(controller.prune("27.2", "27B52", 1), [])
+        helper.assert_not_called()
+        self.assertTrue((applications / "Xcode.app").exists())
+
+    def test_hand_installed_xcode_is_set_aside_before_deletion_so_a_failure_stays_visible(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        applications = Path(temporary.name).resolve()
+        app = applications / "Xcode.app"
+        app.mkdir()
+        with patch.object(controller.shutil, "rmtree", side_effect=OSError(1, "Operation not permitted")):
+            with self.assertRaisesRegex(controller.UpdateError, "could not remove .*Xcode.app \\(see .*Xcode.app.removing\\)"):
+                controller.remove_app(app)
+        self.assertFalse(app.exists())
+        self.assertTrue((applications / "Xcode.app.removing").is_dir())
+        # The leftover blocks a second attempt rather than being silently deleted beside it.
+        app.mkdir()
+        with self.assertRaisesRegex(controller.UpdateError, "left from an earlier removal"):
+            controller.remove_app(app)
 
     def test_selected_hand_installed_xcode_is_protected(self):
         temporary = tempfile.TemporaryDirectory()

@@ -756,8 +756,10 @@ def version_key(version):
     return tuple(int(part) for part in version.split("."))
 
 
-def owned_by_caller(path):
-    return path.lstat().st_uid == os.getuid()
+def removable_by_caller(app):
+    """A hand-installed bundle the caller can delete without root: the caller
+    owns it and can unlink it from /Applications."""
+    return app.lstat().st_uid == os.getuid() and os.access(app.parent, os.W_OK)
 
 
 def remove_app(app):
@@ -766,10 +768,17 @@ def remove_app(app):
     if app.name != "Xcode.app":
         root_helper("remove", app)
         return
+    # Set it aside first: a delete that fails part-way (App Management, a
+    # root-owned file inside) then leaves a visibly half-removed bundle, not an
+    # Xcode.app whose xcodebuild is gone and which no later prune would see.
+    aside = app.with_name("Xcode.app.removing")
+    if aside.exists():
+        raise UpdateError(f"{aside} is left from an earlier removal; remove it by hand")
     try:
-        shutil.rmtree(app)
+        app.rename(aside)
+        shutil.rmtree(aside)
     except OSError as error:
-        raise UpdateError(f"could not remove {app}: {error.strerror}") from error
+        raise UpdateError(f"could not remove {app} (see {aside}): {error.strerror}") from error
 
 
 def prune(version, build, retain, previous=None, window=False):
@@ -813,23 +822,20 @@ def prune(version, build, retain, previous=None, window=False):
         # Only a bundle Xcode itself identifies is ours to remove.
         if identity is not None:
             candidates.append((version_key(match.group(1)), app))
-    if plain.is_dir() and not plain.is_symlink() and plain.resolve() not in protected:
+    # The root helper removes only Factory's versioned bundles, so a plain
+    # Xcode.app is a candidate only when the caller can delete it: one owned
+    # by root (an App Store install) stays, for removal by hand, rather than
+    # failing every later reconcile.
+    if plain.is_dir() and not plain.is_symlink() and plain.resolve() not in protected and removable_by_caller(plain):
         try:
             identity = installed_build(plain)
         except UpdateError:
             identity = None
-        if identity is not None:
+        if identity is not None and re.fullmatch(r"[0-9]+(\.[0-9]+)*", identity[0]):
             candidates.append((version_key(identity[0]), plain))
     candidates.sort(reverse=True)
-    surplus = [app for _, app in candidates[max(0, retain - len(protected)):]]
-    # The root helper removes only Factory's versioned bundles; a plain
-    # Xcode.app is removed as the caller, so it must be the caller's. Decide
-    # before touching anything so a refusal leaves the host as it was.
-    for app in surplus:
-        if app.name == "Xcode.app" and not owned_by_caller(app):
-            raise UpdateError(f"{app} is not owned by this user; remove it by hand (sudo rm -rf {app})")
     removed = []
-    for app in surplus:
+    for _, app in candidates[max(0, retain - len(protected)):]:
         remove_app(app)
         removed.append(str(app))
     return removed
