@@ -15,6 +15,7 @@ ASSIGNMENTS = {
     "CODESIGN": "/usr/bin/codesign",
     "RM": "/bin/rm",
     "MV": "/bin/mv",
+    "CP": "/bin/cp",
     "CHOWN": "/usr/sbin/chown",
     "CHMOD": "/bin/chmod",
 }
@@ -49,6 +50,7 @@ if [[ "$1" == -p ]]; then [[ -s {self.selected} ]] || exit 1; cat {self.selected
         executable(bin_dir / "rm", f'echo "rm $*" >> {self.log}\n')
         executable(bin_dir / "codesign", f'echo "codesign $*" >> {self.log}; [[ "$(cat {self.signed})" == yes ]]\n')
         executable(bin_dir / "mv", f'echo "mv $*" >> {self.log}; /bin/mv "$@"\n')
+        executable(bin_dir / "cp", f'echo "cp $*" >> {self.log}; /bin/cp "$@"\n')
         # Fakes for root-only steps: record, and make the tree read-only the way
         # a root:wheel go-w tree is to the worker user.
         executable(bin_dir / "chown", f'echo "chown $*" >> {self.log}\n')
@@ -60,7 +62,7 @@ if [[ "$1" == -p ]]; then [[ -s {self.selected} ]] || exit 1; cat {self.selected
         self.addCleanup(lambda: subprocess.run(["/bin/chmod", "-R", "u+w", str(self.root)], check=False, capture_output=True))
         source = SCRIPT.read_text()
         replacements = {"APPLICATIONS": self.apps, "QUARANTINE": self.quarantine, "XCODE_SELECT": bin_dir / "xcode-select",
-                        "SPCTL": bin_dir / "spctl", "CODESIGN": bin_dir / "codesign", "RM": bin_dir / "rm", "MV": bin_dir / "mv",
+                        "SPCTL": bin_dir / "spctl", "CODESIGN": bin_dir / "codesign", "RM": bin_dir / "rm", "MV": bin_dir / "mv", "CP": bin_dir / "cp",
                         "CHOWN": bin_dir / "chown", "CHMOD": bin_dir / "chmod"}
         for name, original in ASSIGNMENTS.items():
             line = f"{name}={original}\n"
@@ -155,7 +157,7 @@ exit 0
         self.assertEqual(code, 0, stderr)
         quarantined = self.quarantine / "Xcode_27.2.app"
         binary = quarantined / "Contents/Developer/usr/bin/xcodebuild"
-        self.assertEqual(log[:5], [f"mv {source} {quarantined}", f"chown -R root:wheel {quarantined}", f"chmod -R go-w {quarantined}",
+        self.assertEqual(log[:5], [f"cp -Rc {source} {quarantined}", f"chown -R root:wheel {quarantined}", f"chmod -R go-w {quarantined}",
                                    f"codesign --verify --deep --strict {quarantined}", f"spctl --assess --type execute {quarantined}"])
         executed = [line for line in log if line.startswith("xcodebuild ")]
         self.assertEqual(executed, [f"xcodebuild {binary} -version", f"xcodebuild {binary} -license accept",
@@ -164,6 +166,30 @@ exit 0
         self.assertEqual(log[-1], f"mv {quarantined} {self.apps}/Xcode_27.2.app")
         self.assertFalse(evil.exists())
         self.assertTrue((self.apps / "Xcode_27.2.app/Contents/Developer/usr/bin/xcodebuild").is_file())
+        # Root never deletes the user-controlled source; the controller's temporary directory does.
+        self.assertTrue(source.is_dir())
+        self.assertFalse(any(line.startswith(("rm ", "mv " + str(source))) for line in log))
+
+    def test_open_handle_on_the_source_cannot_reach_the_installed_copy(self):
+        source, _ = self.expanded()
+        binary = source / "Contents/Developer/usr/bin/xcodebuild"
+        with open(binary, "r+b") as handle:
+            code, stderr, _ = self.call("install", source, "27.2")
+            self.assertEqual(code, 0, stderr)
+            handle.seek(0)
+            handle.write(b"#!/bin/bash\ntouch /tmp/never\n")
+            handle.flush()
+        installed = self.apps / "Xcode_27.2.app/Contents/Developer/usr/bin/xcodebuild"
+        self.assertNotIn(b"/tmp/never", installed.read_bytes())
+
+    def test_install_refuses_a_clone_that_is_not_a_real_directory(self):
+        source, _ = self.expanded()
+        bin_dir = self.root / "bin"
+        executable(bin_dir / "cp", f'echo "cp $*" >> {self.log}; /bin/ln -s {self.work} "${{@: -1}}"\n')
+        code, stderr, log = self.call("install", source, "27.2")
+        self.assertEqual(code, 1)
+        self.assertIn("is not a directory", stderr)
+        self.assertFalse(any(line.startswith(("chown", "codesign", "xcodebuild")) for line in log))
 
     def test_install_validates_arguments_before_moving(self):
         source, _ = self.expanded()

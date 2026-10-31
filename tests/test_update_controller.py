@@ -195,6 +195,8 @@ class UpdateControllerTests(unittest.TestCase):
         self.assertTrue(Path(helper[0][4]).is_relative_to(root / "state"))
         self.assertFalse(any(argv[0] == "/bin/mv" for argv in commands))
         components.assert_called_once_with(applications / "Xcode_27.2.app", ["MetalToolchain"])
+        # The helper clones and leaves the source; the temporary directory removes it.
+        self.assertFalse(Path(helper[0][4]).exists())
 
     def test_stage_refuses_when_helper_install_leaves_wrong_identity(self):
         temporary = tempfile.TemporaryDirectory()

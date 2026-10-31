@@ -252,8 +252,10 @@ recorded with its actual output.
   showed that checking a bundle with `spctl` and then executing its `xcodebuild`
   in place is still a race: the worker user owns the bundle and can write
   `/Applications`, so it can swap the binary or a first-launch package between
-  check and exec. So `install` moves the expanded download into a root-only
-  quarantine (`/var/root/morpheus-factory-xcode`), makes it root-owned and
+  check and exec. So `install` clones the expanded download (`cp -Rc`, APFS
+  copy-on-write) into a root-only quarantine (`/var/root/morpheus-factory-xcode`);
+  a clone rather than a move, because a write handle the user already holds on
+  a moved file still works, while a clone's bytes are out of its reach. It makes it root-owned and
   unwritable, and only then verifies it (`codesign --deep --strict`, `spctl`,
   the reported version), runs `-license accept` and `-runFirstLaunch`, and moves
   it into `/Applications`; a failure leaves it in quarantine for manual

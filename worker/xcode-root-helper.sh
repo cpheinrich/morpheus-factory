@@ -21,6 +21,7 @@ SPCTL=/usr/sbin/spctl
 CODESIGN=/usr/bin/codesign
 RM=/bin/rm
 MV=/bin/mv
+CP=/bin/cp
 MKDIR=/bin/mkdir
 CHOWN=/usr/sbin/chown
 CHMOD=/bin/chmod
@@ -51,9 +52,13 @@ if [[ "$verb" == install ]]; then
   [[ ! -e "$target" && ! -L "$target" ]] || refuse "$target already exists"
   [[ ! -e "$quarantined" && ! -L "$quarantined" ]] || refuse "$quarantined already exists; inspect it, then sudo rm -rf $quarantined"
   # Take the bundle out of the worker user's reach before verifying or running
-  # anything in it: a check on a user-writable bundle can be raced.
+  # anything in it: a check on a user-writable bundle can be raced. Clone it
+  # (APFS clonefile) rather than move it, so a write handle a user process
+  # still holds on the original cannot reach the copy's bytes. The source is
+  # never deleted as root; the controller's temporary directory removes it.
   "$MKDIR" -p -m 700 "$QUARANTINE"
-  "$MV" "$src" "$quarantined"
+  "$CP" -Rc "$src" "$quarantined" || refuse "could not clone $src into $QUARANTINE (it must be on the same APFS volume)"
+  [[ -d "$quarantined" && ! -L "$quarantined" ]] || refuse "clone of $src is not a directory; inspect and sudo rm -rf $quarantined"
   trap 'echo "morpheus-factory-xcode: install failed; the bundle is left in $quarantined (remove with sudo rm -rf $quarantined)" >&2' ERR
   "$CHOWN" -R root:wheel "$quarantined"
   "$CHMOD" -R go-w "$quarantined"

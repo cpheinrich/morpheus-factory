@@ -157,9 +157,13 @@ Checking a bundle in place and then executing it can be raced: the worker user
 (or any CI job on the host's runner) owns the expanded download and can write
 `/Applications`, so it could copy an installed Xcode to a new name, let the check
 pass, then replace `usr/bin/xcodebuild` or a package `-runFirstLaunch` installs
-between the check and the exec. So `install` first moves the bundle into
+between the check and the exec. So `install` first clones the bundle with `cp -Rc` into
 `/var/root/morpheus-factory-xcode/Xcode_<version>.app` (root's home is
-`root:wheel 700` and on the same APFS volume, so this is a rename), then
+`root:wheel 700` and on the same APFS volume, so the clone shares extents and
+takes seconds). It clones rather than moves because a write handle a user process
+already holds on the original would follow a moved file, but cannot reach a
+copy-on-write clone's bytes; the source is never deleted as root, and the
+controller's temporary directory removes it. Then
 `chown -R root:wheel` and `chmod -R go-w`, and only then runs
 `codesign --verify --deep --strict` and `spctl --assess --type execute`, checks
 that `xcodebuild -version` reports `Xcode <version>`, runs `-license accept` and
