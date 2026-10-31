@@ -355,6 +355,23 @@ class ConsumerPrTests(unittest.TestCase):
         with command, git_file:
             self.assertEqual(controller.ensure_consumer_pr(Path("/evo"), PIN, CONSUMER), ("https://github.com/darwin-health/evo/pull/700", "opened"))
 
+    def test_merged_pr_with_surviving_branch_waits_for_human(self):
+        merged = {"number": 6, "url": "https://github.com/darwin-health/evo/pull/6", "state": "MERGED", "isDraft": False, "mergedAt": "2026-10-29T00:00:00Z"}
+        older_closed = {"number": 5, "url": "https://github.com/darwin-health/evo/pull/5", "state": "CLOSED", "isDraft": True, "mergedAt": None}
+        repo = FakeRepo(old_files(), prs=[older_closed, merged], remote_branch="abc123\trefs/heads/factory/xcode-27.2-27B52")
+        command, git_file = repo.patches()
+        with command, git_file:
+            self.assertEqual(controller.ensure_consumer_pr(Path("/evo"), PIN, CONSUMER), ("https://github.com/darwin-health/evo/pull/6", "merged"))
+        self.assertFalse(any(call[:3] == ["gh", "pr", "create"] or "push" in call for call in repo.calls))
+
+    def test_newest_closed_pr_wins_over_older_merged(self):
+        merged = {"number": 5, "url": "https://github.com/darwin-health/evo/pull/5", "state": "MERGED", "isDraft": False, "mergedAt": "2026-10-28T00:00:00Z"}
+        closed = {"number": 6, "url": "https://github.com/darwin-health/evo/pull/6", "state": "CLOSED", "isDraft": True, "mergedAt": None}
+        repo = FakeRepo(old_files(), prs=[merged, closed])
+        command, git_file = repo.patches()
+        with command, git_file:
+            self.assertEqual(controller.ensure_consumer_pr(Path("/evo"), PIN, CONSUMER), ("https://github.com/darwin-health/evo/pull/6", "closed"))
+
     def test_existing_branch_is_not_rewritten(self):
         repo = FakeRepo(old_files(), remote_branch="abc123\trefs/heads/factory/xcode-27.2-27B52")
         command, git_file = repo.patches()
@@ -421,6 +438,15 @@ class ReconcileTests(unittest.TestCase):
         result, events = self.run_reconcile({"xcode": {"version": "27.2", "build": "27B52", "phase": "stage"}, "ci": CI},
                                             status={"installedMatches": True, "selectedMatches": False}, pinned=[])
         self.assertEqual((result, events), ("held-at-stage", ["sync-tools", "image-stage"]))
+        self.assertFalse((self.root / "fleet.json").exists())
+
+    def test_reverted_merge_waits_for_human_without_agent(self):
+        result, events = self.run_reconcile({"xcode": {"version": "27.2", "build": "27B52"}, "ci": CI},
+                                            status={"installedMatches": True, "selectedMatches": False}, pinned=[False],
+                                            pr=("https://github.com/darwin-health/evo/pull/6", "merged"))
+        self.assertEqual(result, "waiting-human: consumer pin PR https://github.com/darwin-health/evo/pull/6 merged but main "
+                                 "no longer carries the pin; delete branch factory/xcode-27.2-27B52 to retry")
+        self.assertEqual(events, ["sync-tools", "image-stage", "pr"])
         self.assertFalse((self.root / "fleet.json").exists())
 
     def test_closed_pr_waits_for_human_without_agent(self):

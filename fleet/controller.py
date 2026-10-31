@@ -258,19 +258,27 @@ def open_pin_pr(root: Path, pin: Pin, consumer: Consumer) -> str:
 
 
 def ensure_consumer_pr(root: Path, pin: Pin, consumer: Consumer) -> tuple[str, str]:
-    """Return (PR URL, "opened" | "open" | "closed"). Never rewrites an existing branch or PR.
+    """Return (PR URL, "opened" | "open" | "closed" | "merged"). Never rewrites an existing branch or PR.
 
-    A closed, unmerged PR is an operator's rejection: it is never recreated, or a
-    fresh draft would appear every tick and the agent cap would never apply.
+    Called only while merged main lacks the pin. An open PR wins; otherwise the
+    newest PR decides. A closed, unmerged PR is an operator's rejection: it is
+    never recreated, or a fresh draft would appear every tick and the agent cap
+    would never apply. A merged PR whose branch survives means main was reverted;
+    GitHub refuses a new PR from that branch, so a human decides.
     """
     branch = pin_branch(pin)
     listed = json.loads(command(["gh", "pr", "list", "--repo", consumer.repository, "--head", branch, "--state", "all",
                                  "--json", "number,url,state,isDraft,mergedAt"]) or "[]")
-    for state in ("OPEN", "CLOSED"):
-        for pr in listed:
-            if pr.get("state") == state and not pr.get("mergedAt"):
-                return pr["url"], state.lower()
-    if command(["git", "-C", str(root), "ls-remote", "--heads", "origin", branch]):
+    for pr in listed:
+        if pr.get("state") == "OPEN":
+            return pr["url"], "open"
+    newest = max(listed, key=lambda pr: pr.get("number", 0), default=None)
+    if newest and not newest.get("mergedAt"):
+        return newest["url"], "closed"
+    branch_exists = bool(command(["git", "-C", str(root), "ls-remote", "--heads", "origin", branch]))
+    if newest and branch_exists:
+        return newest["url"], "merged"
+    if branch_exists:
         files = "See the branch diff; the branch already existed when this PR was opened."
     else:
         files = open_pin_pr(root, pin, consumer)
@@ -390,6 +398,8 @@ def advance_consumer(config: HostConfig, factory: Path, root: Path, state_path: 
     url, pr_state = ensure_consumer_pr(root, pin, consumer)
     if pr_state == "closed":
         return f"waiting-human: consumer pin PR {url} was closed; delete branch {pin_branch(pin)} to retry"
+    if pr_state == "merged":
+        return f"waiting-human: consumer pin PR {url} merged but main no longer carries the pin; delete branch {pin_branch(pin)} to retry"
     if pr_state == "opened":
         return "waiting-consumer-pr"
     state = private_state(state_path, pin)
