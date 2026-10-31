@@ -72,9 +72,17 @@ class Consumer:
     # Transitional lanes the consumer keeps on an older Xcode on purpose; they
     # are neither judged nor rewritten. Remove entries when the files go.
     ignore_paths: tuple[str, ...] = ()
+    # Declared, temporary (path glob, version) pairs the consumer runs on purpose
+    # beside the pin, such as a production lane held on an older Xcode while a
+    # UI-suite regression is triaged. They are not judged; they are not rewritten
+    # either, because substitution only touches the previous pin's tokens.
+    exceptions: tuple[tuple[str, str], ...] = ()
 
     def ignores(self, path: str) -> bool:
         return any(fnmatch.fnmatch(path, pattern) for pattern in self.ignore_paths)
+
+    def excepted(self, path: str, version: str) -> bool:
+        return any(version == allowed and fnmatch.fnmatch(path, pattern) for pattern, allowed in self.exceptions)
 
 
 @dataclass(frozen=True)
@@ -84,6 +92,9 @@ class HostConfig:
     has_ci: bool
     consumer: Consumer = field(default_factory=Consumer)
     paths: dict = field(default_factory=dict)
+    # A declared rollout hold: the tick does nothing for this host, not even
+    # staging or image activation, until the reviewed manifest removes it.
+    hold: str | None = None
 
 
 def _relative_path(value: object) -> str:
@@ -109,8 +120,17 @@ def read_consumer(data: dict) -> Consumer:
     ignore_paths = raw.get("ignorePaths", [])
     if not isinstance(ignore_paths, list):
         raise FleetError("consumer ignorePaths must be a list")
+    exceptions = raw.get("exceptions", [])
+    if not isinstance(exceptions, list):
+        raise FleetError("consumer exceptions must be a list")
+    pairs = []
+    for entry in exceptions:
+        if not isinstance(entry, dict) or not isinstance(entry.get("version"), str) or not VERSION.fullmatch(entry["version"]) \
+                or not isinstance(entry.get("reason"), str) or not entry["reason"].strip():
+            raise FleetError("each consumer exception needs a relative path, an exact version and a reason")
+        pairs.append((_relative_path(entry.get("path")), entry["version"]))
     return Consumer(repository, assertion, tuple(_relative_path(path) for path in pin_paths),
-                    tuple(_relative_path(path) for path in ignore_paths))
+                    tuple(_relative_path(path) for path in ignore_paths), tuple(pairs))
 
 
 def read_host(manifest: Path, host: str) -> HostConfig:
@@ -129,7 +149,10 @@ def read_host(manifest: Path, host: str) -> HostConfig:
     paths = entry.get("paths", {})
     if not isinstance(paths, dict) or any(not isinstance(value, str) or not value.startswith("/") for value in paths.values()):
         raise FleetError("host paths must be absolute")
-    return HostConfig(Pin(version, build, phase), role, has_ci, read_consumer(data), dict(paths))
+    hold = entry.get("hold")
+    if hold is not None and (not isinstance(hold, str) or not hold.strip()):
+        raise FleetError("host hold must be a reason string")
+    return HostConfig(Pin(version, build, phase), role, has_ci, read_consumer(data), dict(paths), hold)
 
 
 def read_pin(manifest: Path, host: str) -> Pin:
@@ -159,11 +182,11 @@ def consumer_has_pin(root: Path, pin: Pin, consumer: Consumer) -> bool:
         if not path.endswith(".yml") or consumer.ignores(path):
             continue
         body = git_file(root, "origin/main", path)
-        versions = XCODE_VERSION_VALUE.findall(body)
+        versions = [v for v in XCODE_VERSION_VALUE.findall(body) if not consumer.excepted(path, v)]
         if any(version != pin.version for version in versions):
             return False
         labels = [label for line in RUNNER_LINE.findall(body) for label in RUNNER_LABEL.findall(line)]
-        if any(label != pin.version for label in labels):
+        if any(label != pin.version and not consumer.excepted(path, label) for label in labels):
             return False
         pinned_somewhere = pinned_somewhere or bool(versions)
     # An empty match set is not a pass: nothing pinned is not correctly pinned.
@@ -416,6 +439,8 @@ def advance_consumer(config: HostConfig, factory: Path, root: Path, state_path: 
 
 def reconcile(factory: Path, consumer_root: Path, host_setup: Path, manifest: Path, host: str, state_dir: Path, credentials_project: Path | None = None) -> str:
     config = read_host(manifest, host)
+    if config.hold:
+        return f"held: {config.hold}"
     credentials_project = credentials_project or consumer_root
     status = host_status(factory, manifest, host)
     if not status["installedMatches"]:
@@ -481,7 +506,7 @@ def main() -> int:
     config = read_host(manifest, args.host)
     consumer_root, host_setup, credentials_project = resolve_paths(args, config)
     if args.command == "status":
-        print(json.dumps({"pin": config.pin.key, "phase": config.pin.phase, "role": config.role,
+        print(json.dumps({"pin": config.pin.key, "phase": config.pin.phase, "role": config.role, "hold": config.hold,
                           "consumerPinned": consumer_pinned(consumer_root, config),
                           "host": host_status(factory, manifest, args.host)}, sort_keys=True))
         return 0

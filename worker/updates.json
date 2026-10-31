@@ -14,6 +14,7 @@
   "hosts": {
     "zoe-mac-mini": {
       "role": "ci-image",
+      "hold": "Xcode 27.2 rollout is on hold (Chris, 2026-10-30): Evo's full UI suite on 27.2 had 29 first-pass failures and ran over 3 h, so Evo returns to 26.6 everywhere. Remove this hold to resume.",
       "xcode": {
         "version": "27.2",
         "build": "27B52",
@@ -46,17 +47,13 @@
       },
       "validation": [
         {
-          "argv": [
-            "/usr/bin/python3",
-            "/Users/zoe/code/morpheus-factory/worker/validate_evo_main.py",
-            "--repo",
-            "/Users/zoe/code/evo"
-          ]
+          "argv": ["/usr/bin/python3", "/Users/zoe/code/morpheus-factory/worker/validate_evo_main.py", "--repo", "/Users/zoe/code/evo"]
         }
       ]
     },
     "christophers-macbook-pro": {
       "role": "phone-gate",
+      "hold": "Xcode 27.2 rollout is on hold (Chris, 2026-10-30): Evo's full UI suite on 27.2 had 29 first-pass failures and ran over 3 h, so Evo returns to 26.6 everywhere. Remove this hold to resume.",
       "xcode": {
         "version": "27.2",
         "build": "27B52",
@@ -95,19 +92,13 @@
       },
       "validation": [
         {
-          "argv": [
-            "/usr/bin/python3",
-            "/Users/chrisheinrich/code/morpheus-factory/worker/validate_evo_main.py",
-            "--repo",
-            "/Users/chrisheinrich/code/evo",
-            "--device-gate",
-            "00008120-00122CC80233401E"
-          ]
+          "argv": ["/usr/bin/python3", "/Users/chrisheinrich/code/morpheus-factory/worker/validate_evo_main.py", "--repo", "/Users/chrisheinrich/code/evo", "--device-gate", "00008120-00122CC80233401E"]
         }
       ]
     },
     "christophers-macbook-air": {
       "role": "phone-gate",
+      "hold": "Xcode 27.2 rollout is on hold (Chris, 2026-10-30): Evo's full UI suite on 27.2 had 29 first-pass failures and ran over 3 h, so Evo returns to 26.6 everywhere. Remove this hold to resume.",
       "xcode": {
         "version": "27.2",
         "build": "27B52",
@@ -130,14 +121,7 @@
       },
       "validation": [
         {
-          "argv": [
-            "/usr/bin/python3",
-            "/Users/chrisheinrich/code/morpheus-factory/worker/validate_evo_main.py",
-            "--repo",
-            "/Users/chrisheinrich/code/evo",
-            "--device-gate",
-            "00008150-0015741E3AEA401C"
-          ]
+          "argv": ["/usr/bin/python3", "/Users/chrisheinrich/code/morpheus-factory/worker/validate_evo_main.py", "--repo", "/Users/chrisheinrich/code/evo", "--device-gate", "00008150-0015741E3AEA401C"]
         }
       ]
     }

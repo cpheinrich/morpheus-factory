@@ -230,6 +230,35 @@ class ConsumerPinTests(unittest.TestCase):
             self.assertIs(controller.consumer_has_pin(Path("/evo"), new, CONSUMER), False)  # workflows still say 27.2
             self.assertIs(controller.consumer_has_pin(Path("/evo"), PIN, CONSUMER), False)  # assertion says 27.3
 
+    def test_declared_exception_admits_one_version_in_one_path_only(self):
+        files = pinned_files()
+        files[".github/workflows/ios-delivery.yml"] += "  production:\n    runs-on: macos-vm\n    with:\n      xcode-version: '26.6'\n"
+        self.assertIs(self.check(files)[0], False)
+        consumer = controller.read_consumer({"consumer": {"exceptions": [
+            {"path": ".github/workflows/ios-delivery.yml", "version": "26.6", "reason": "production held on 26.6"}]}})
+        self.assertEqual(consumer.exceptions, ((".github/workflows/ios-delivery.yml", "26.6"),))
+        repo = FakeRepo(files)
+        command, git_file = repo.patches()
+        with command, git_file:
+            self.assertIs(controller.consumer_has_pin(Path("/evo"), PIN, consumer), True)
+        # The same version elsewhere, or another version in the excepted file, still fails.
+        for path, extra in ((".github/workflows/ios-ci.yml", "xcode-version: '26.6'\n"), (".github/workflows/ios-delivery.yml", "xcode-version: '26.5'\n")):
+            broken = dict(files)
+            broken[path] += extra
+            repo = FakeRepo(broken)
+            command, git_file = repo.patches()
+            with command, git_file:
+                self.assertIs(controller.consumer_has_pin(Path("/evo"), PIN, consumer), False, (path, extra))
+        # An exception never stands in for the pin itself.
+        only_exception = {".github/workflows/ios-delivery.yml": "jobs:\n  production:\n    with:\n      xcode-version: '26.6'\n", ASSERTION: files[ASSERTION]}
+        repo = FakeRepo(only_exception)
+        command, git_file = repo.patches()
+        with command, git_file:
+            self.assertIs(controller.consumer_has_pin(Path("/evo"), PIN, consumer), False)
+        for bad in ([{"path": "x.yml", "version": "26.6"}], [{"path": "x.yml", "version": "latest", "reason": "r"}], [{"path": "/x.yml", "version": "26.6", "reason": "r"}], "x"):
+            with self.assertRaises(controller.FleetError):
+                controller.read_consumer({"consumer": {"exceptions": bad}})
+
     def test_no_workflow_mentions_xcode_version_fails(self):
         files = pinned_files()
         files[".github/workflows/ios-delivery.yml"] = "jobs:\n  test:\n    runs-on: xcode-27.2\n"
@@ -418,6 +447,17 @@ class ReconcileTests(unittest.TestCase):
              patch.object(controller, "run_agent", side_effect=lambda *a: events.append("agent")):
             result = controller.reconcile(self.root, self.root, self.root, manifest, "zoe-mac-mini", self.root)
         return result, events
+
+    def test_declared_hold_stops_the_tick_before_any_action(self):
+        manifest = write_manifest(self.root, {"xcode": {"version": "27.2", "build": "27B52", "phase": "promote"}, "ci": CI,
+                                              "hold": "rollout on hold"})
+        with patch.object(controller, "host_status", side_effect=AssertionError("must not run")), \
+             patch.object(controller, "host_action", side_effect=AssertionError("must not run")), \
+             patch.object(controller, "sync_host_tools", side_effect=AssertionError("must not run")), \
+             patch.object(controller, "consumer_has_pin", side_effect=AssertionError("must not run")):
+            self.assertEqual(controller.reconcile(self.root, self.root, self.root, manifest, "zoe-mac-mini", self.root), "held: rollout on hold")
+        with self.assertRaisesRegex(controller.FleetError, "hold must be a reason"):
+            controller.read_host(write_manifest(self.root, {"xcode": {"version": "27.2", "build": "27B52"}, "hold": ""}), "zoe-mac-mini")
 
     def test_stage_gate_precedes_everything(self):
         result, events = self.run_reconcile({"xcode": {"version": "27.2", "build": "27B52"}, "ci": CI},

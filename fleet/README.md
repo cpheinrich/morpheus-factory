@@ -16,6 +16,13 @@ bounded step.
 `role` defaults to `ci-image` when the entry has `ci`, otherwise `phone-gate`;
 a `ci-image` role without `ci` (or the reverse) is refused.
 
+## Hold
+
+A host entry with `"hold": "<reason>"` makes the tick return `held: <reason>`
+before any action: no staging, no image activation, no consumer PR, no switch.
+It is the reviewed way to pause a rollout (the 27.2 rollout is held since
+2026-10-30 while Evo returns to 26.6). `status` shows the hold.
+
 ## Order
 
 1. Stage the approved app through the host's credentials companion.
@@ -71,9 +78,17 @@ Results: `waiting-host-stage`, `waiting-consumer-pr`, `waiting-consumer-merge`,
   "repository": "darwin-health/evo",
   "assertion": "apps/ios/scripts/ci/assert-xcode-build.sh",
   "pinPaths": [".github/workflows/*.yml", "apps/ios/scripts/ci/assert-xcode-build.sh"],
-  "ignorePaths": [".github/workflows/cd-v2-*.yml"]
+  "ignorePaths": [".github/workflows/cd-v2-*.yml"],
+  "exceptions": [{"path": ".github/workflows/ios-delivery.yml", "version": "26.6", "reason": "…"}]
 }
 ```
+
+`exceptions` declares a version the consumer runs on purpose beside the pin in
+one path (a production lane held on an older Xcode while a regression is
+triaged). Such a value is not judged, and substitution never touches it because
+only the previous pin's tokens are rewritten; it never stands in for the pin
+itself, and the same version in any other path still fails. Each entry needs a
+reason; remove it when the lane returns to the pin.
 
 Optional and top-level; those are the defaults except `ignorePaths`, which
 defaults to none and is set in the reviewed manifest while Evo's CD V2 lane
