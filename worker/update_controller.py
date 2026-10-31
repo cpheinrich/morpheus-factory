@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -391,6 +392,26 @@ def request_verification_code(verification, started_at, timeout_seconds, length)
     return code
 
 
+def _answer_hidden_prompt(master, line, timeout=5.0):
+    """Write a reply to a prompt xcodes reads with readpassphrase(3).
+
+    readpassphrase first resets the terminal with TCSAFLUSH, which discards any
+    input already queued. Writing the reply the instant the prompt text arrives
+    therefore loses it and both sides wait forever (the Pro, 2026-10-31). The
+    terminal reports echo off once readpassphrase is reading, so wait for that
+    before writing; the master shares the slave's termios on macOS.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if not termios.tcgetattr(master)[3] & termios.ECHO:
+                break
+        except termios.error:
+            break
+        time.sleep(0.05)
+    os.write(master, line)
+
+
 def _xcodes_interactive_attempt(argv, verification, wait_seconds, first_challenge, apple=None):
     """Drive xcodes' one-shot SMS prompt through a private pseudo-terminal."""
     master, slave = pty.openpty()
@@ -418,7 +439,7 @@ def _xcodes_interactive_attempt(argv, verification, wait_seconds, first_challeng
                     output = (output + chunk.decode("utf-8", errors="replace"))[-131072:]
                     recent = output[-8192:]
                     if not sms_selected and 'Enter "sms"' in recent and "trusted devices:" in recent:
-                        os.write(master, b"sms\n")
+                        _answer_hidden_prompt(master, b"sms\n")
                         sms_selected = True
                     if not phone_selected and "Select a trusted phone number to receive a code via SMS:" in recent:
                         choices = re.findall(r"(?m)^([0-9]+): .+$", recent)
@@ -441,7 +462,7 @@ def _xcodes_interactive_attempt(argv, verification, wait_seconds, first_challeng
                             code = request_verification_code(verification, challenge_started, wait_seconds, int(match.group(1)))
                         except CodeTimeout as error:
                             raise CodeTimeout(str(error), challenge_started) from error
-                        os.write(master, f"{code}\n".encode())
+                        _answer_hidden_prompt(master, f"{code}\n".encode())
                         code_submitted = True
                     continue
             if process.poll() is not None:
