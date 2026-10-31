@@ -8,3 +8,4 @@ dist/
 factory.json
 .env
 .env.*
+__pycache__/
