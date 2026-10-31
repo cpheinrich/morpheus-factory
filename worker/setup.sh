@@ -28,4 +28,6 @@ else
   echo "Local factory prerequisites are ready."
   echo "Fleet activation still needs a factory.json catalog, broker access, provider CLIs,"
   echo "and the Morpheus execution adapter. No provider credentials are copied by this script."
+  echo "Hosts that serve CI/CD: register a runner with worker/runner.sh install (token on stdin)."
+  echo "Xcode pins: python3 worker/install_updates.py --host <host> --credentials-project <path> (docs/host-updates.md)."
 fi

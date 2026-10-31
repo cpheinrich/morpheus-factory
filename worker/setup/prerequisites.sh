@@ -7,3 +7,11 @@ xcode-select -p >/dev/null 2>&1 || {
   exit 1
 }
 echo "macOS and command-line tools ready"
+if ((WORKER_CHECK_ONLY)); then
+  # Report only: the sudoers rule needs a password, so the operator adds it once.
+  if sudo -n true 2>/dev/null; then
+    echo "sudo -n: ready"
+  else
+    echo "sudo -n: password required — Xcode staging and activation need passwordless sudo for exact commands; see docs/host-updates.md"
+  fi
+fi
