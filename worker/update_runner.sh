@@ -14,7 +14,7 @@ while (($#)); do
     *) echo "unknown argument" >&2; exit 2 ;;
   esac
 done
-[[ -n "$host" && -n "$manifest" && -n "$credentials_project" && "$github_user" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || { echo "missing or invalid update runner input" >&2; exit 2; }
+[[ -n "$host" && -n "$manifest" && "$github_user" =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || { echo "missing or invalid update runner input" >&2; exit 2; }
 [[ -z "$provider_command" && -z "$provider_url" || -n "$provider_command" && -n "$provider_url" ]] || { echo "provider command and URL must be supplied together" >&2; exit 2; }
 if [[ -n "$provider_command" ]]; then
   [[ "$provider_command" == /* && -x "$provider_command" && "$provider_url" == https://* ]] || { echo "invalid verification provider configuration" >&2; exit 78; }
@@ -28,6 +28,14 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GIT_TERMINAL_PROMPT=0 git -C "$root" -c credential.helper= fetch origin main
 git -C "$root" merge --ff-only origin/main
 [[ -f "$manifest" ]] || { echo "manifest is missing" >&2; exit 78; }
+if [[ -z "$credentials_project" ]]; then
+  # Fall back to the host's reviewed manifest entry; refuse if it has none.
+  credentials_project="$(python3 -c 'import json, sys
+host = json.load(open(sys.argv[1]))["hosts"].get(sys.argv[2]) or {}
+print((host.get("paths") or {}).get("credentialsProject", ""))' "$manifest" "$host" 2>/dev/null)" || credentials_project=""
+  [[ "$credentials_project" == /* ]] || { echo "no --credentials-project and the manifest gives no paths.credentialsProject for $host" >&2; exit 78; }
+fi
+[[ -d "$credentials_project" ]] || { echo "credentials project is missing" >&2; exit 78; }
 cd "$credentials_project"
 # Fleet is the sole sequencer: it stages the host and image, waits for the
 # reviewed consumer/promotion merges, then invokes host reconcile. The wrapper

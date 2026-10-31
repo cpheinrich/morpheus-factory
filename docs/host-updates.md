@@ -1,32 +1,142 @@
 # Host update controller
 
-`worker/update_controller.py` is the first host-side reconciler. It handles an
-exact Xcode version and build on one Mac. It does not infer "latest" or change
-Evo's CI pins. The reviewed JSON manifest is the authority. `stage` downloads
-and installs a side-by-side `/Applications/Xcode_<version>.app`; `promote` runs
-the declared validation with `DEVELOPER_DIR` set to that app before switching
-the command-line default. The prior Xcode stays installed for rollback.
+`worker/update_controller.py` reconciles one Mac's Xcode with an exact version
+and build pinned in the reviewed manifest `worker/updates.json`. It never infers
+"latest" and never edits a consumer's CI pins. `stage` downloads and installs a
+side-by-side `/Applications/Xcode_<version>.app`; promotion runs the host's
+declared validation with `DEVELOPER_DIR` set to that app, then switches the
+command-line default with `sudo -n xcode-select --switch`. Validation commands
+are `argv` arrays, never shell text, and execute on the host, so the manifest
+must come from protected main.
 
-The initial reviewed manifest is `worker/updates.json`; copy its host entry
-when adding another Mac. The `phase` defaults to `stage` and
-must be changed to `promote` in a reviewed commit after the canary and CI image
-are ready. Validation commands are `argv` arrays, never shell text. The manifest
-must come from a trusted branch because those commands execute on the host.
+## Host kinds
+
+Each host entry has a `role`:
+
+- **`ci-image`** (default when a `ci` block is present) — the host builds and
+  activates a Tart CI image for the pinned Xcode (see `image-stage` below). Zoe's
+  Mac mini is this kind.
+- **`phone-gate`** (default otherwise) — the host has a physical iPhone and runs
+  a consumer's device gate with its *selected* Xcode. It has no image. Its
+  validation is a signed device build: `validate_evo_main.py --device-gate <UDID>`
+  runs Evo's `apps/ios/scripts/dev.sh build-device-gate <UDID>` in a detached
+  worktree of freshly fetched `origin/main`. The MacBook Pro
+  (`christophers-macbook-pro`) is Evo's delivery phone gate; the MacBook Air is a
+  second phone-gate host. The shipped binary is built on 27.2 CI VMs, so both are
+  pinned to Xcode 27.2 (27B52) and held at `phase: "stage"` until each host is
+  prepared and `check` passes.
+
+**Do not reconcile the Pro while an Evo delivery run is in progress.** Activation
+defers while a runner job is live (below), but staging and validation still
+compete with the gate for the machine and the phone.
+
+## Manifest fields
+
+All fields beyond `xcode` and `validation` are optional; `schemaVersion` stays 1.
+
+| Field | Meaning | Default |
+|---|---|---|
+| `role` | `ci-image` or `phone-gate` | `ci-image` if `ci` is present, else `phone-gate` |
+| `xcode.version`, `xcode.build` | exact pin | required |
+| `xcode.components` | components such as `MetalToolchain`, re-requested every run | `[]` |
+| `xcode.phase` | `stage` holds the host after installing; `promote` validates and switches | absent means `promote` |
+| `xcode.retain` | Xcode bundles to keep in total, including the selected one (integer ≥ 1) | `2` |
+| `paths.factory`, `paths.consumer`, `paths.hostSetup`, `paths.credentialsProject` | absolute directories on this host | Factory checkout, `~/code/evo`, `~/code/agent-host-setup` (ci-image only), the consumer |
+| `apple.idVar`, `apple.passwordVar` | **names** of the environment variables holding the Apple Account login | `APPLE_ID`, `APPLE_ID_PASSWORD` |
+| `verification` | `purpose` and `account` for the SMS code provider | none |
+| `ci` | image builder, verifier, activator, repository, image and label (ci-image only) | none |
+| `runner.label` | the GitHub Actions runner LaunchAgent label to check | none |
+| `runner.dir` | absolute runner directory | none |
+| `runner.requiredEnv` | variable names the runner's `.env` must define | `[]` |
+| `runner.organization` | GitHub organization whose runner groups must be readable | none |
+| `signing.identity`, `signing.team` | code-signing identity name and 10-character team id | none |
+| `device.udid` | hardware UDID of the gate iPhone | none |
+
+A hold is always explicit: a host stays staged only while its entry says
+`"phase": "stage"`. Lifting it is a reviewed manifest change.
+
+## `check`
+
+```sh
+python3 worker/update_controller.py check --host <host> --manifest worker/updates.json --json
+```
+
+prints `{"ok": bool, "checks": [{"name", "ok", "detail"}]}` and exits 1 when any
+check fails. A check that cannot determine its answer reports `ok: false` with
+"could not be determined", never a pass. Checks, in order:
+
+1. `xcodes` — on `PATH`.
+2. `disk` — at least 70 GiB free on `/Applications` unless the pinned app is
+   already installed.
+3. `sudo` — `sudo -n -l` allows each exact command staging, activation and
+   pruning use. Add the line the detail prints to `/etc/sudoers.d/morpheus-factory`
+   with `visudo -f`; it has this form:
+
+   ```
+   <user> ALL=(root) NOPASSWD: /bin/mv, /usr/bin/xcode-select --switch *, /bin/rm -rf -- /Applications/Xcode_*.app, /Applications/Xcode_<v>.app/Contents/Developer/usr/bin/xcodebuild -license accept, /Applications/Xcode_<v>.app/Contents/Developer/usr/bin/xcodebuild -runFirstLaunch
+   ```
+
+   Unrestricted `mv` makes this root-equivalent for that login, so grant it only
+   to the host's own automation user. A new Xcode version needs the line updated.
+4. `apple-credentials` — both configured variables are set and nonempty. Only the
+   names are printed.
+5. `verification-provider` (hosts with `verification`) —
+   `FACTORY_VERIFICATION_CODE_COMMAND` is an executable absolute path and
+   `FACTORY_VERIFICATION_CODE_URL` is `https`.
+6. `paths` — each directory exists; `factory` and `consumer` are git checkouts.
+7. `ci` (ci-image) — builder, verifier, activator and `tart` are executable.
+8. `runner` (with `runner.label`) — `~/Library/LaunchAgents/<label>.plist` exists
+   and has no true `SessionCreate`. With `SessionCreate` the runner gets a new
+   security session in which the login keychain is locked, and `codesign` fails
+   with `errSecInternalComponent`; the stock `svc.sh` re-adds it. Fix:
+   `plutil -remove SessionCreate <plist>`, then
+   `launchctl bootout gui/<uid>/<label>` and `launchctl bootstrap gui/<uid> <plist>`.
+9. `runner-env` (with `runner.dir` and `runner.requiredEnv`) — `<dir>/.env`
+   defines every named key. On the Pro the phone gate's `morpheus credentials run`
+   needs `MORPHEUS_CREDENTIALS_REPO` there, and a stock runner installer rerun
+   silently drops it.
+10. `runner-groups` (with `runner.organization`) —
+    `gh api orgs/<org>/actions/runner-groups` succeeds. A 403 means the
+    device-runner installer's group-proof step cannot be refreshed from this host:
+    it needs a token with `admin:org` or a browser session on the organization's
+    runner-groups settings page.
+11. `signing` (with `signing`) — exactly one valid code-signing identity named
+    `<identity>: …` whose certificate's organizational unit is the team. (The
+    parenthesised suffix of an Apple Development name is a personal id, not the
+    team.) Two matching identities make `CODE_SIGN_IDENTITY="Apple Development"`
+    ambiguous; the detail lists both SHA-1 fingerprints so one can be removed.
+12. `device` (with `device.udid`) — `xcrun devicectl list devices` lists the UDID
+    as `connected` or `available`; `unavailable`, `connecting`, absent or a command
+    error fails.
+13. `validation` — each validation executable exists and is executable.
+
+## Preflight
+
+`stage`, `image-stage` and `reconcile` run the install checks first (`xcodes`,
+`disk`, `sudo`, `apple-credentials`, `verification-provider` when configured,
+`paths`) and refuse with `preflight: <failed names>` before any download, so a
+missing sudo rule or credential no longer surfaces after a multi-GB fetch. Run
+`check` for the details.
+
+## Credentials
+
+The credential wrapper exposes the host's configured Apple variables (Zoe and the
+Pro use `ZOE_APPLE_ID` / `ZOE_APPLE_ID_PASSWORD` for the shared developer account;
+other hosts default to `APPLE_ID` / `APPLE_ID_PASSWORD`). The controller passes
+only those two values, renamed to the `XCODES_*` variables, to the `xcodes`
+downloader. Every other child receives a small allowlisted environment. The Apple
+Account is not an App Store Connect API key. Never put the password or
+verification code in the manifest, a command argument, or logs; the manifest
+holds variable names only.
 
 ```sh
 python3 worker/update_controller.py status --host zoe-mac-mini --manifest worker/updates.json
-cd /Users/zoe/code/evo
-morpheus credentials run -- python3 /path/to/factory/worker/update_controller.py auth-check
+cd <paths.credentialsProject>
+morpheus credentials run -- python3 /path/to/factory/worker/update_controller.py auth-check \
+  --host zoe-mac-mini --manifest /path/to/factory/worker/updates.json
 morpheus credentials run -- python3 /path/to/factory/worker/update_controller.py reconcile \
   --host zoe-mac-mini --manifest /path/to/factory/worker/updates.json
 ```
-
-The credential wrapper exposes `ZOE_APPLE_ID` and `ZOE_APPLE_ID_PASSWORD` to
-the controller. It passes only those two values, renamed to the `XCODES_*`
-variables, to the `xcodes` downloader. Every other child receives a small
-allowlisted environment. The Apple Account is not an App Store Connect API key.
-Never put the password or verification code in the manifest, a command argument,
-or logs.
 
 For unattended SMS challenges, a host may set `FACTORY_VERIFICATION_CODE_COMMAND`
 to an absolute executable path. Factory launches that executable directly, with
@@ -54,31 +164,32 @@ seconds; it waits 180 seconds after the third send. The provider keeps the
 original challenge start time on retries so a late earlier SMS can be considered.
 The resulting timeout is explicit. An Apple rate limit, locked challenge or
 rejected code stops the run rather than causing more sends. Staging errors leave
-the selected Xcode unchanged. A missing provider is reported as an authentication
-requirement when Apple's cached session expires. `auth-login` remains available
-for an interactive recovery, but must not run from launchd.
+the selected Xcode unchanged. `auth-login` remains available for an interactive
+recovery, but must not run from launchd.
 
-After merging a reviewed manifest, install the hourly reconciler from the
-Factory main checkout:
+## Installing the hourly runner
+
+After merging a reviewed manifest, check and install from the Factory main
+checkout. `--credentials-project` defaults to the host's
+`paths.credentialsProject`:
 
 ```sh
-python3 worker/install_updates.py --check --host zoe-mac-mini --credentials-project /Users/zoe/code/evo \
-  --github-user cpheinrich \
+python3 worker/install_updates.py --check --host zoe-mac-mini --github-user cpheinrich \
   --provider-command /absolute/path/to/code-provider --provider-url https://broker.tailnet.ts.net
-python3 worker/install_updates.py --host zoe-mac-mini --credentials-project /Users/zoe/code/evo \
-  --github-user cpheinrich \
+python3 worker/install_updates.py --host zoe-mac-mini --github-user cpheinrich \
   --provider-command /absolute/path/to/code-provider --provider-url https://broker.tailnet.ts.net
 ```
 
-It fetches and fast-forwards Factory main only when the checkout is clean and
-on `main`, then invokes the [fleet coordinator](../fleet/README.md) through a
-GitHub-only credential wrapper. The coordinator stages the host through the
-specified host credentials project, verifies and activates the exact CI image,
-waits for reviewed Evo and promotion merges, and only then calls host
-`reconcile` through that same credentials project. No secret appears in its
-plist; the selected GitHub account login is a nonsecret installer option. It logs to
-`~/Library/Logs/morpheus-factory/host-updates.log` and repeats hourly. A pin
-change on protected main is therefore picked up by the next successful tick.
+`--check` runs the controller's `check` inside the credentials project, the way
+the runner will, prints one line per check and exits nonzero when any fails.
+Installing refuses on the same failure. The runner fetches and fast-forwards
+Factory main only when the checkout is clean and on `main`, then invokes the
+[fleet coordinator](../fleet/README.md) through a GitHub-only credential wrapper;
+`update_runner.sh` also falls back to the manifest's `paths.credentialsProject`
+when started without `--credentials-project`. No secret appears in its plist;
+the GitHub account login is a nonsecret installer option. It logs to
+`~/Library/Logs/morpheus-factory/host-updates.log` and repeats hourly, so a pin
+change on protected main is picked up by the next successful tick.
 The URL and executable path are not secrets and are passed by the installer;
 `FACTORY_VERIFICATION_CODE_TOKEN` must come from the chosen host's credentials
 project. Give each host a distinct token and credentials source. Reusing the
@@ -86,18 +197,31 @@ same shared companion on all hosts would expose every host's token to every
 other host, defeating independent revocation. The router admin credential is
 needed only on the SMS reader host, never on Factory hosts.
 
-The controller checks for 70 GiB free, one update at a time, an existing app
-with a conflicting build, the downloaded app's exact version/build, and macOS
-security assessment. It refuses to switch while `xcodebuild` or
-`swift-frontend` is active. If post-switch verification fails it restores the
-previous selected developer directory. An Xcode update can require a new
-simulator runtime; the validation command must cover the consumer's actual
-build destination. The Tart image and consumer workflow pins still require a
-coordinated rollout; `image-stage` prepares the host image and pool before the
-consumer PR runs.
+## Safety
 
-The optional `ci` block supplies a host-local image builder, verifier, pool
-activator, repository, image and runner label. The fleet coordinator calls
+The controller allows one update at a time, refuses an existing app with a
+conflicting build, checks the downloaded app's exact version/build and macOS
+security assessment, and validates before switching. **Activation defers** while
+`xcodebuild`, `swift-frontend` or a GitHub Actions `Runner.Worker` is running: a
+job can sit between build steps with no compiler running, and switching then
+would change the toolchain mid-job. An idle `Runner.Listener` does not defer. If
+post-switch verification fails the controller restores the previous selected
+developer directory. An Xcode update can require a new simulator runtime; the
+validation command must cover the consumer's actual build destination.
+
+**Pruning.** After a successful promotion, and on every `already-current`
+reconcile, the controller keeps the selected Xcode plus the newest other
+`/Applications/Xcode_<version>.app` bundles up to `xcode.retain` in total
+(default 2: the selected one and one rollback), comparing versions numerically.
+It removes the rest with `sudo -n /bin/rm -rf --`, listing them under `removed`
+in the result. It only considers `Xcode_<version>.app` bundles whose
+`xcodebuild -version` it can read, and never removes `/Applications/Xcode.app` or
+the selected app. Simulator runtimes are never deleted.
+
+## CI images (ci-image hosts)
+
+The `ci` block supplies a host-local image builder, verifier, pool activator,
+repository, image and runner label. The fleet coordinator calls
 `python3 worker/update_controller.py image-stage --host <host> --manifest worker/updates.json`
 before opening consumer pin PRs. It stages the exact app, builds a missing Tart
 image, boots a disposable clone to verify its exact Xcode version and build,
@@ -109,14 +233,11 @@ guest verification. Other repositories retain their current image and cache.
 The consumer workflow still moves by reviewed PR, and the host pin moves to
 `promote` only after the consumer's CI run passes.
 
-The reviewed manifest pins 27.2 build 27B52 in `promote` phase and declares
+Zoe's entry pins 27.2 build 27B52 in `promote` phase and declares
 `MetalToolchain`, which Evo's iOS build needs. The reconciler asks Xcode to
 download each declared component even when the app is already installed, so a
 component interrupted by an outage is retried. Promotion validates a detached
-worktree at freshly fetched Evo `origin/main`, leaving Zoe's dirty task checkout
-untouched. It then switches `xcode-select` and restores the prior selection if
-verification fails.
-Once the approved version is selected, hourly reconciles repair components but
-skip the full Evo rebuild. The `reconcile` command is safe to repeat. The fleet
-coordinator connects host image readiness, consumer PR/CI evidence and the
-reviewed phase change before declaring convergence.
+worktree at freshly fetched Evo `origin/main`, leaving the primary checkout
+untouched. Once the approved version is selected, hourly reconciles repair
+components and prune but skip the full rebuild. The `reconcile` command is safe
+to repeat.

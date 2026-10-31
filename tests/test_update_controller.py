@@ -1,10 +1,13 @@
 import importlib.util
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -26,8 +29,11 @@ class UpdateControllerTests(unittest.TestCase):
         return path
 
     def test_pin_requires_exact_identity_and_absolute_validation(self):
-        self.assertEqual(controller.pin_for_host(self.manifest(), "mini")[:2], ("27.2", "27B52"))
-        self.assertEqual(controller.pin_for_host(self.manifest(xcode={"version": "27.2", "build": "27B52", "phase": "promote"}), "mini")[3], "promote")
+        pin = controller.pin_for_host(self.manifest(), "mini")
+        self.assertEqual((pin.version, pin.build, pin.phase), ("27.2", "27B52", "stage"))
+        self.assertEqual(controller.pin_for_host(self.manifest(xcode={"version": "27.2", "build": "27B52", "phase": "promote"}), "mini").phase, "promote")
+        # An absent phase means promote; a hold is always explicit.
+        self.assertEqual(controller.pin_for_host(self.manifest(xcode={"version": "27.2", "build": "27B52"}), "mini").phase, "promote")
         with self.assertRaisesRegex(controller.UpdateError, "exact numeric"):
             controller.pin_for_host(self.manifest(xcode={"version": "latest", "build": "27B52"}), "mini")
         with self.assertRaisesRegex(controller.UpdateError, "absolute path"):
@@ -36,8 +42,9 @@ class UpdateControllerTests(unittest.TestCase):
             controller.pin_for_host(self.manifest(xcode={"version": "27.2", "build": "27B52", "components": ["../../metal"]}), "mini")
 
     def test_xcodes_gets_only_apple_credentials(self):
+        zoe = {"idVar": "ZOE_APPLE_ID", "passwordVar": "ZOE_APPLE_ID_PASSWORD"}
         with patch.dict(os.environ, {"ZOE_APPLE_ID": "user@example.test", "ZOE_APPLE_ID_PASSWORD": "secret", "ASC_ISSUER_ID": "must-not-pass"}):
-            env = controller.xcodes_environment()
+            env = controller.xcodes_environment(zoe)
         self.assertEqual(env["XCODES_USERNAME"], "user@example.test")
         self.assertEqual(env["XCODES_PASSWORD"], "secret")
         self.assertNotIn("ASC_ISSUER_ID", env)
@@ -63,7 +70,7 @@ class UpdateControllerTests(unittest.TestCase):
         with patch.dict(os.environ, {"ZOE_APPLE_ID": "user@example.test", "ZOE_APPLE_ID_PASSWORD": "secret", "ASC_ISSUER_ID": "other-secret"}), \
              patch.object(controller.shutil, "which", return_value="/opt/homebrew/bin/xcodes"), \
              patch.object(controller.subprocess, "run", return_value=Result()) as child:
-            self.assertEqual(controller.interactive_login(), "apple-authenticated")
+            self.assertEqual(controller.interactive_login({"idVar": "ZOE_APPLE_ID", "passwordVar": "ZOE_APPLE_ID_PASSWORD"}), "apple-authenticated")
         self.assertNotIn("ASC_ISSUER_ID", child.call_args.kwargs["env"])
 
     def test_stage_phase_never_validates_or_switches(self):
@@ -220,7 +227,7 @@ print('authenticated')
                 raise controller.CodeTimeout("no SMS yet")
             return "123456"
 
-        with patch.dict(os.environ, {"ZOE_APPLE_ID": "user@example.test", "ZOE_APPLE_ID_PASSWORD": "secret", "FACTORY_VERIFICATION_CODE_COMMAND": "/usr/bin/true"}), \
+        with patch.dict(os.environ, {"APPLE_ID": "user@example.test", "APPLE_ID_PASSWORD": "secret", "FACTORY_VERIFICATION_CODE_COMMAND": "/usr/bin/true"}), \
              patch.object(controller, "request_verification_code", side_effect=provider):
             result = controller.run_xcodes([sys.executable, str(script), str(sends)], {"purpose": "apple-developer", "account": "zoe-apple-developer"})
         self.assertEqual(result, "xcodes-complete")
@@ -236,6 +243,489 @@ print('authenticated')
         self.assertEqual(attempts.call_count, 3)
         self.assertEqual(attempts.call_args_list[1].args[-1], start)
 
+
+
+FINGERPRINT_A = "A" * 40
+FINGERPRINT_B = "B" * 40
+FINGERPRINT_C = "C" * 40
+UDID = "00008120-00122CC80233401E"
+
+
+class ManifestFieldTests(unittest.TestCase):
+    def host(self, **fields):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "manifest.json"
+        entry = {"xcode": {"version": "27.2", "build": "27B52"}, "validation": [{"argv": ["/usr/bin/true"]}]}
+        xcode = fields.pop("xcode", {})
+        entry["xcode"].update(xcode)
+        entry.update(fields)
+        path.write_text(json.dumps({"schemaVersion": 1, "hosts": {"mini": entry}}))
+        return controller.pin_for_host(path, "mini")
+
+    def test_defaults_are_generic(self):
+        pin = self.host()
+        self.assertEqual(pin.apple, {"idVar": "APPLE_ID", "passwordVar": "APPLE_ID_PASSWORD"})
+        self.assertEqual(pin.role, "phone-gate")
+        self.assertEqual(pin.retain, 2)
+        self.assertEqual(pin.paths["consumer"], str(Path.home() / "code/evo"))
+        self.assertEqual(pin.paths["credentialsProject"], pin.paths["consumer"])
+        self.assertNotIn("hostSetup", pin.paths)
+        self.assertIsNone(pin.runner)
+
+    def test_retain_boundary(self):
+        self.assertEqual(self.host(xcode={"retain": 1}).retain, 1)
+        for bad in (0, -1, "2", True, 1.5):
+            with self.assertRaisesRegex(controller.UpdateError, "retain"):
+                self.host(xcode={"retain": bad})
+
+    def test_identifier_fields_are_validated(self):
+        self.assertEqual(self.host(device={"udid": UDID}).device_udid, UDID)
+        for bad in ("00008120-00122CC80233401", "00008120-00122CC80233401EF", "0000812000122CC80233401E", "0000812G-00122CC80233401E"):
+            with self.assertRaisesRegex(controller.UpdateError, "udid"):
+                self.host(device={"udid": bad})
+        self.assertEqual(self.host(signing={"identity": "Apple Development", "team": "TAML3DQJTR"}).signing["team"], "TAML3DQJTR")
+        for bad in ("TAML3DQJT", "TAML3DQJTRX", "taml3dqjtr"):
+            with self.assertRaisesRegex(controller.UpdateError, "team"):
+                self.host(signing={"identity": "Apple Development", "team": bad})
+        self.assertEqual(self.host(apple={"idVar": "ZOE_APPLE_ID"}).apple, {"idVar": "ZOE_APPLE_ID", "passwordVar": "APPLE_ID_PASSWORD"})
+        for bad in ({"idVar": "zoe_apple_id"}, {"idVar": "1APPLE"}, {"other": "X"}):
+            with self.assertRaisesRegex(controller.UpdateError, "apple"):
+                self.host(apple=bad)
+        with self.assertRaisesRegex(controller.UpdateError, "absolute"):
+            self.host(paths={"consumer": "code/evo"})
+        with self.assertRaisesRegex(controller.UpdateError, "paths accepts"):
+            self.host(paths={"evo": "/x"})
+        with self.assertRaisesRegex(controller.UpdateError, "runner.label"):
+            self.host(runner={"label": "bad/label"})
+        with self.assertRaisesRegex(controller.UpdateError, "runner.dir"):
+            self.host(runner={"label": "a.b", "dir": "runner"})
+        with self.assertRaisesRegex(controller.UpdateError, "requiredEnv"):
+            self.host(runner={"label": "a.b", "requiredEnv": ["lower"]})
+        with self.assertRaisesRegex(controller.UpdateError, "organization"):
+            self.host(runner={"label": "a.b", "organization": "-bad"})
+        with self.assertRaisesRegex(controller.UpdateError, "ci-image host requires"):
+            self.host(role="ci-image")
+
+    def test_repository_manifest_entries(self):
+        manifest = SCRIPT.parents[0] / "updates.json"
+        zoe = controller.pin_for_host(manifest, "zoe-mac-mini")
+        self.assertEqual((zoe.role, zoe.phase, zoe.apple["idVar"]), ("ci-image", "promote", "ZOE_APPLE_ID"))
+        self.assertEqual(zoe.paths["hostSetup"], "/Users/zoe/code/agent-host-setup")
+        pro = controller.pin_for_host(manifest, "christophers-macbook-pro")
+        self.assertEqual((pro.role, pro.phase, pro.version, pro.build), ("phone-gate", "stage", "27.2", "27B52"))
+        self.assertEqual(pro.runner, {"label": "actions.runner.darwin-health.evo-cd-mbp-device",
+                                      "dir": "/Users/chrisheinrich/actions-runner-evo-cd-mbp-device",
+                                      "requiredEnv": ["MORPHEUS_CREDENTIALS_REPO"], "organization": "darwin-health"})
+        self.assertEqual(pro.checks[0]["argv"][-2:], ["--device-gate", UDID])
+        air = controller.pin_for_host(manifest, "christophers-macbook-air")
+        self.assertEqual((air.apple, air.runner, air.verification, air.phase),
+                         ({"idVar": "APPLE_ID", "passwordVar": "APPLE_ID_PASSWORD"}, None, None, "stage"))
+        self.assertEqual(air.device_udid, "00008150-0015741E3AEA401C")
+
+    def test_xcodes_names_the_configured_variables_when_missing(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(controller.UpdateError, "MY_ID and MY_PASSWORD are missing"):
+                controller.xcodes_environment({"idVar": "MY_ID", "passwordVar": "MY_PASSWORD"})
+        with patch.dict(os.environ, {"APPLE_ID": "u@example.test", "APPLE_ID_PASSWORD": "p", "ZOE_APPLE_ID": "other"}, clear=True):
+            env = controller.xcodes_environment()
+        self.assertEqual((env["XCODES_USERNAME"], env["XCODES_PASSWORD"]), ("u@example.test", "p"))
+
+
+class FakeHost:
+    """A healthy phone-gate host; tests flip one fact at a time."""
+
+    def __init__(self, test):
+        temporary = tempfile.TemporaryDirectory()
+        test.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.home = self.root / "home"
+        for name in ("factory", "evo", "runner"):
+            (self.root / name / ".git").mkdir(parents=True)
+        self.label = "actions.runner.org.device"
+        self.plist = self.home / "Library/LaunchAgents" / f"{self.label}.plist"
+        self.plist.parent.mkdir(parents=True)
+        self.plist.write_bytes(controller.plistlib.dumps({"Label": self.label, "ProgramArguments": ["/bin/true"]}))
+        (self.root / "runner/.env").write_text("LANG=en_US.UTF-8\nMORPHEUS_CREDENTIALS_REPO=/x/.credentials\n")
+        manifest = self.root / "manifest.json"
+        manifest.write_text(json.dumps({"schemaVersion": 1, "hosts": {"pro": {
+            "role": "phone-gate",
+            "xcode": {"version": "27.2", "build": "27B52", "phase": "stage"},
+            "paths": {"factory": str(self.root / "factory"), "consumer": str(self.root / "evo")},
+            "apple": {"idVar": "ZOE_APPLE_ID", "passwordVar": "ZOE_APPLE_ID_PASSWORD"},
+            "verification": {"purpose": "apple-developer", "account": "zoe-apple-developer"},
+            "runner": {"label": self.label, "dir": str(self.root / "runner"), "requiredEnv": ["MORPHEUS_CREDENTIALS_REPO"], "organization": "darwin-health"},
+            "signing": {"identity": "Apple Development", "team": "TAML3DQJTR"},
+            "device": {"udid": UDID},
+            "validation": [{"argv": [sys.executable, "-c", "pass"]}],
+        }}}))
+        self.manifest = manifest
+        self.pin = controller.pin_for_host(manifest, "pro")
+        self.free = 70 * 1024**3
+        self.installed = None
+        self.sudo_refused = set()
+        self.identities = [(FINGERPRINT_A, "Apple Development: Chris (266U7M6NPQ)", "TAML3DQJTR"),
+                           (FINGERPRINT_B, "Apple Development: chris@example.test (BB58HPM92M)", "D495224G8R")]
+        self.device_state = "connected"
+        self.gh = (0, "")
+        self.env = {"ZOE_APPLE_ID": "user@example.test", "ZOE_APPLE_ID_PASSWORD": "secret",
+                    "FACTORY_VERIFICATION_CODE_COMMAND": sys.executable,
+                    "FACTORY_VERIFICATION_CODE_URL": "https://broker.example.test", "USER": "chris"}
+        self.commands = []
+
+    def run(self, argv, **kwargs):
+        self.commands.append(argv)
+        if argv[:3] == ["/usr/bin/sudo", "-n", "-l"]:
+            if argv[3] in self.sudo_refused:
+                raise controller.UpdateError("sudo exited 1")
+            return argv[3]
+        if argv[:2] == ["/usr/bin/security", "find-identity"]:
+            lines = [f'  {index}) {fingerprint} "{name}"' for index, (fingerprint, name, _) in enumerate(self.identities, 1)]
+            return "\n".join(lines + [f"     {len(lines)} valid identities found"])
+        if argv[:2] == ["/usr/bin/security", "find-certificate"]:
+            return "\n".join(f"SHA-1 hash: {fingerprint}\n-----BEGIN CERTIFICATE-----\n{team}\n-----END CERTIFICATE-----"
+                             for fingerprint, _, team in self.identities)
+        if argv[:3] == ["/usr/bin/xcrun", "devicectl", "list"]:
+            return ("Name   Hostname   Identifier   State   Model\n"
+                    f"Phone   phone.local   {UDID} (UDID)   {self.device_state}   iPhone 15 Pro (iPhone16,1)\n"
+                    "Sim      5267E2AE-9663-4E13-A209-6FD35BB5F699 (UDID)   shutdown   iPhone 17 Pro")
+        raise AssertionError(argv)
+
+    def gh_run(self, argv, **kwargs):
+        self.commands.append(argv)
+        code, stderr = self.gh
+        return SimpleNamespace(returncode=code, stdout="secret-body", stderr=stderr)
+
+    @contextmanager
+    def patched(self):
+        team = lambda pem: pem.split("\n")[1]
+        which = lambda name: f"/opt/homebrew/bin/{name}"
+        with patch.dict(os.environ, self.env, clear=True), \
+             patch.object(controller.Path, "home", return_value=self.home), \
+             patch.object(controller.shutil, "which", side_effect=which), \
+             patch.object(controller.shutil, "disk_usage", return_value=SimpleNamespace(free=self.free)), \
+             patch.object(controller, "matching_app", return_value=self.installed), \
+             patch.object(controller, "certificate_team", side_effect=team), \
+             patch.object(controller.subprocess, "run", side_effect=self.gh_run), \
+             patch.object(controller, "run", side_effect=self.run):
+            yield
+
+    def checks(self):
+        with self.patched():
+            return {check["name"]: check for check in controller.host_checks(self.pin)}
+
+
+class CheckTests(unittest.TestCase):
+    ALL = ["xcodes", "disk", "sudo", "apple-credentials", "verification-provider", "paths", "runner", "runner-env",
+           "runner-groups", "signing", "device", "validation"]
+
+    def failing(self, host):
+        return sorted(name for name, check in host.checks().items() if not check["ok"])
+
+    def test_healthy_host_passes_every_check(self):
+        host = FakeHost(self)
+        checks = host.checks()
+        self.assertEqual(list(checks), self.ALL)
+        self.assertEqual([name for name, check in checks.items() if not check["ok"]], [])
+        self.assertIn(FINGERPRINT_A, checks["signing"]["detail"])
+        self.assertEqual(checks["device"]["detail"], f"{UDID} is connected")
+        sudo = [argv[3:] for argv in host.commands if argv[:3] == ["/usr/bin/sudo", "-n", "-l"]]
+        xcodebuild = "/Applications/Xcode_27.2.app/Contents/Developer/usr/bin/xcodebuild"
+        self.assertEqual(sudo, [["/bin/mv"], ["/usr/bin/xcode-select", "--switch", "/Applications/Xcode_27.2.app/Contents/Developer"],
+                                ["/bin/rm", "-rf", "--", "/Applications/Xcode_27.2.app"],
+                                [xcodebuild, "-license", "accept"], [xcodebuild, "-runFirstLaunch"]])
+
+    def test_disk_boundary_and_installed_app(self):
+        host = FakeHost(self)
+        host.free = 70 * 1024**3 - 1
+        self.assertEqual(self.failing(host), ["disk"])
+        host.installed = Path("/Applications/Xcode_27.2.app")
+        self.assertEqual(host.checks()["disk"], {"name": "disk", "ok": True, "detail": "pinned Xcode is already installed"})
+
+    def test_refused_sudo_names_the_sudoers_line(self):
+        host = FakeHost(self)
+        host.sudo_refused = {"/bin/rm"}
+        checks = host.checks()
+        self.assertEqual(self.failing(host), ["sudo"])
+        detail = checks["sudo"]["detail"]
+        self.assertIn("/etc/sudoers.d/morpheus-factory", detail)
+        self.assertIn("chris ALL=(root) NOPASSWD: /bin/mv, /usr/bin/xcode-select --switch *, /bin/rm -rf -- /Applications/Xcode_*.app, "
+                      "/Applications/Xcode_27.2.app/Contents/Developer/usr/bin/xcodebuild -license accept, "
+                      "/Applications/Xcode_27.2.app/Contents/Developer/usr/bin/xcodebuild -runFirstLaunch", detail)
+
+    def test_missing_credentials_print_names_never_values(self):
+        host = FakeHost(self)
+        host.env["ZOE_APPLE_ID_PASSWORD"] = ""
+        checks = host.checks()
+        self.assertEqual(self.failing(host), ["apple-credentials"])
+        self.assertEqual(checks["apple-credentials"]["detail"], "missing or empty: ZOE_APPLE_ID_PASSWORD")
+        self.assertNotIn("user@example.test", json.dumps(checks))
+
+    def test_provider_requires_https(self):
+        host = FakeHost(self)
+        host.env["FACTORY_VERIFICATION_CODE_URL"] = "http://broker.example.test"
+        self.assertEqual(self.failing(host), ["verification-provider"])
+
+    def test_two_identities_for_one_team_are_ambiguous(self):
+        host = FakeHost(self)
+        host.identities.append((FINGERPRINT_C, "Apple Development: Chris (266U7M6NPQ)", "TAML3DQJTR"))
+        detail = host.checks()["signing"]["detail"]
+        self.assertEqual(self.failing(host), ["signing"])
+        self.assertIn(f"{FINGERPRINT_A}, {FINGERPRINT_C}", detail)
+
+    def test_no_identity_for_team_fails(self):
+        host = FakeHost(self)
+        host.identities = [host.identities[1]]
+        self.assertEqual(self.failing(host), ["signing"])
+        self.assertEqual(host.checks()["signing"]["detail"], 'no valid "Apple Development" identity for team TAML3DQJTR')
+
+    def test_device_must_be_connected_or_available(self):
+        host = FakeHost(self)
+        host.device_state = "available"
+        self.assertEqual(self.failing(host), [])
+        for state in ("unavailable", "connecting"):
+            host.device_state = state
+            self.assertEqual(self.failing(host), ["device"])
+
+    def test_device_command_error_is_not_a_pass(self):
+        host = FakeHost(self)
+        original = host.run
+
+        def broken(argv, **kwargs):
+            if argv[:2] == ["/usr/bin/xcrun", "devicectl"]:
+                raise controller.UpdateError("xcrun exited 1")
+            return original(argv, **kwargs)
+
+        host.run = broken
+        checks = host.checks()
+        self.assertEqual(checks["device"], {"name": "device", "ok": False, "detail": "could not be determined: xcrun exited 1"})
+
+    def test_session_create_and_missing_plist_fail_with_fix(self):
+        host = FakeHost(self)
+        host.plist.write_bytes(controller.plistlib.dumps({"Label": host.label, "SessionCreate": True}))
+        detail = host.checks()["runner"]["detail"]
+        self.assertEqual(self.failing(host), ["runner"])
+        self.assertIn(f"plutil -remove SessionCreate {host.plist}", detail)
+        self.assertIn(f"launchctl bootstrap gui/{os.getuid()} {host.plist}", detail)
+        host.plist.write_bytes(controller.plistlib.dumps({"Label": host.label, "SessionCreate": False}))
+        self.assertEqual(self.failing(host), [])
+        host.plist.unlink()
+        self.assertEqual(host.checks()["runner"], {"name": "runner", "ok": False, "detail": f"runner LaunchAgent not installed: {host.plist}"})
+
+    def test_runner_env_must_define_required_names(self):
+        host = FakeHost(self)
+        (host.root / "runner/.env").write_text("LANG=en_US.UTF-8\n# MORPHEUS_CREDENTIALS_REPO=/x\n")
+        detail = host.checks()["runner-env"]["detail"]
+        self.assertEqual(self.failing(host), ["runner-env"])
+        self.assertIn("does not define MORPHEUS_CREDENTIALS_REPO", detail)
+        self.assertIn("stock runner installer rerun drops them", detail)
+        self.assertNotIn("/x", detail.replace(str(host.root), ""))
+        (host.root / "runner/.env").unlink()
+        self.assertEqual(self.failing(host), ["runner-env"])
+
+    def test_runner_groups_forbidden_and_error_both_fail(self):
+        host = FakeHost(self)
+        host.gh = (1, "gh: Must have admin rights to Repository. (HTTP 403)")
+        detail = host.checks()["runner-groups"]["detail"]
+        self.assertEqual(self.failing(host), ["runner-groups"])
+        self.assertIn("admin:org", detail)
+        self.assertNotIn("secret-body", detail)
+        host.gh = (1, "error connecting to api.github.com")
+        self.assertEqual(host.checks()["runner-groups"]["detail"], "could not be determined: gh api exited 1")
+        self.assertTrue(any(argv[1:] == ["api", "orgs/darwin-health/actions/runner-groups"] for argv in host.commands))
+
+    def test_missing_validation_executable_fails(self):
+        host = FakeHost(self)
+        host.pin.checks[0]["argv"][0] = str(host.root / "missing")
+        self.assertEqual(self.failing(host), ["validation"])
+
+    def test_check_command_exits_nonzero_but_prints_json(self):
+        host = FakeHost(self)
+        host.device_state = "unavailable"
+        output = io.StringIO()
+        argv = ["update_controller.py", "check", "--host", "pro", "--manifest", str(host.manifest), "--json"]
+        with patch.object(sys, "argv", argv), redirect_stdout(output), host.patched():
+            self.assertEqual(controller.main(), 1)
+        document = json.loads(output.getvalue())
+        self.assertFalse(document["ok"])
+        self.assertEqual([check["name"] for check in document["checks"] if not check["ok"]], ["device"])
+
+    def test_signing_team_comes_from_real_shaped_certificate_subjects(self):
+        subjects = {
+            "PEM-A": ("subject= \n    userId                    = X35TT7TP7E\n"
+                      "    commonName                = Apple Development: Christopher Heinrich (266U7M6NPQ)\n"
+                      "    organizationalUnitName    = TAML3DQJTR\n    organizationName          = Darwin Life Inc.\n"
+                      "    countryName               = US\n"),
+            "PEM-B": ("subject= \n    userId                    = X35TT7TP7E\n"
+                      "    commonName                = Apple Development: cpheinrich@gmail.com (BB58HPM92M)\n"
+                      "    organizationalUnitName    = D495224G8R\n    organizationName          = Christopher Heinrich\n"
+                      "    countryName               = US\n"),
+        }
+        listing = (f'  1) {FINGERPRINT_B} "Apple Development: cpheinrich@gmail.com (BB58HPM92M)"\n'
+                   f'  2) {FINGERPRINT_A} "Apple Development: Christopher Heinrich (266U7M6NPQ)"\n'
+                   f'  3) {FINGERPRINT_C} "iPhone Distribution: Christopher Heinrich (D495224G8R)"\n     3 valid identities found')
+        certificates = (f"SHA-1 hash: {FINGERPRINT_B}\n-----BEGIN CERTIFICATE-----\nPEM-B\n-----END CERTIFICATE-----\n"
+                        f"SHA-1 hash: {FINGERPRINT_A}\n-----BEGIN CERTIFICATE-----\nPEM-A\n-----END CERTIFICATE-----\n")
+        pin = SimpleNamespace(signing={"identity": "Apple Development", "team": "TAML3DQJTR"})
+
+        def security(argv, **kwargs):
+            if argv[1] == "find-identity":
+                return listing
+            if argv[1] == "find-certificate":
+                return certificates
+            raise AssertionError(argv)
+
+        def openssl(argv, **kwargs):
+            self.assertEqual(argv[:3], ["/usr/bin/openssl", "x509", "-noout"])
+            return SimpleNamespace(returncode=0, stdout=subjects[kwargs["input"].split("\n")[1]])
+
+        with patch.object(controller, "run", side_effect=security), patch.object(controller.subprocess, "run", side_effect=openssl):
+            self.assertEqual(controller.check_signing(pin),
+                             (True, f"Apple Development: Christopher Heinrich (266U7M6NPQ) {FINGERPRINT_A}"))
+            pin.signing["team"] = "266U7M6NPQ"  # the name suffix is not the team
+            self.assertEqual(controller.check_signing(pin), (False, 'no valid "Apple Development" identity for team 266U7M6NPQ'))
+            pin.signing["team"] = "D495224G8R"
+            self.assertEqual(controller.check_signing(pin)[0], True)
+        with patch.object(controller, "run", side_effect=controller.UpdateError("security exited 1")):
+            self.assertEqual(controller.check_signing(pin), (False, "could not read identities"))
+        with patch.object(controller, "run", side_effect=security), \
+             patch.object(controller.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout="")):
+            self.assertEqual(controller.check_signing(pin), (False, "could not read identities"))
+
+    def test_certificate_team_reads_organizational_unit(self):
+        subject = "subject= \n    commonName                = Apple Development: Chris (266U7M6NPQ)\n    organizationalUnitName    = TAML3DQJTR\n"
+        with patch.object(controller.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=subject)):
+            self.assertEqual(controller.certificate_team("pem"), "TAML3DQJTR")
+        with patch.object(controller.subprocess, "run", return_value=SimpleNamespace(returncode=1, stdout=subject)):
+            self.assertIsNone(controller.certificate_team("pem"))
+
+
+class PreflightTests(unittest.TestCase):
+    def test_stage_refuses_before_download_when_preflight_fails(self):
+        host = FakeHost(self)
+        host.sudo_refused = {"/bin/mv"}
+        state = host.root / "state"
+        argv = ["update_controller.py", "stage", "--host", "pro", "--manifest", str(host.manifest), "--state-dir", str(state)]
+        with patch.object(sys, "argv", argv), host.patched(), \
+             patch.object(controller, "run_xcodes") as download, patch.object(controller, "stage") as stage:
+            with self.assertRaisesRegex(controller.UpdateError, r"^preflight: sudo$"):
+                controller.main()
+        download.assert_not_called()
+        stage.assert_not_called()
+
+    def test_stage_proceeds_when_preflight_passes(self):
+        host = FakeHost(self)
+        argv = ["update_controller.py", "stage", "--host", "pro", "--manifest", str(host.manifest), "--state-dir", str(host.root / "state")]
+        with patch.object(sys, "argv", argv), host.patched(), redirect_stdout(io.StringIO()), \
+             patch.object(controller, "stage", return_value="staged") as stage:
+            self.assertEqual(controller.main(), 0)
+        stage.assert_called_once()
+        self.assertEqual(stage.call_args.args[-1], {"idVar": "ZOE_APPLE_ID", "passwordVar": "ZOE_APPLE_ID_PASSWORD"})
+
+    def test_preflight_covers_only_install_facts(self):
+        host = FakeHost(self)
+        host.device_state = "unavailable"
+        with host.patched():
+            controller.preflight(host.pin)
+        self.assertEqual(controller.PREFLIGHT, ("xcodes", "disk", "sudo", "apple-credentials", "verification-provider", "paths"))
+
+    def test_reconcile_prunes_after_promotion_and_reports_removed(self):
+        host = FakeHost(self)
+        output = io.StringIO()
+        argv = ["update_controller.py", "reconcile", "--host", "pro", "--manifest", str(host.manifest), "--state-dir", str(host.root / "state")]
+        with patch.object(sys, "argv", argv), redirect_stdout(output), patch.object(controller, "preflight"), \
+             patch.object(controller, "reconcile", return_value="promoted"), \
+             patch.object(controller, "prune", return_value=["/Applications/Xcode_26.3.app"]) as prune:
+            self.assertEqual(controller.main(), 0)
+        prune.assert_called_once_with("27.2", "27B52", 2)
+        self.assertEqual(json.loads(output.getvalue())["removed"], ["/Applications/Xcode_26.3.app"])
+
+    def test_staged_hold_does_not_prune(self):
+        host = FakeHost(self)
+        argv = ["update_controller.py", "reconcile", "--host", "pro", "--manifest", str(host.manifest), "--state-dir", str(host.root / "state")]
+        with patch.object(sys, "argv", argv), redirect_stdout(io.StringIO()), patch.object(controller, "preflight"), \
+             patch.object(controller, "reconcile", return_value="staged"), patch.object(controller, "prune") as prune:
+            controller.main()
+        prune.assert_not_called()
+
+
+class ActivateTests(unittest.TestCase):
+    def activate(self, processes):
+        commands = []
+        app = Path("/Applications/Xcode_27.2.app")
+
+        def command(argv, **kwargs):
+            commands.append(argv)
+            return processes if argv[0] == "/bin/ps" else ""
+
+        with patch.object(controller, "matching_app", return_value=app), patch.object(controller, "run", side_effect=command), \
+             patch.object(controller, "report", return_value={"selectedMatches": True}):
+            result = controller.activate("27.2", "27B52")
+        return result, commands
+
+    def test_live_runner_job_defers_activation(self):
+        for busy in ("/Users/chris/actions-runner/bin/Runner.Worker", "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild",
+                     "swift-frontend"):
+            with self.assertRaisesRegex(controller.UpdateError, "deferred"):
+                self.activate(f"/sbin/launchd\n{busy}\n")
+
+    def test_idle_runner_listener_does_not_defer(self):
+        result, commands = self.activate("/sbin/launchd\n/Users/chris/actions-runner/bin/Runner.Listener\n")
+        self.assertEqual(result, "activated")
+        self.assertIn(["/usr/bin/sudo", "-n", "/usr/bin/xcode-select", "--switch", "/Applications/Xcode_27.2.app/Contents/Developer"], commands)
+
+
+class PruneTests(unittest.TestCase):
+    def prune(self, versions, retain, extra=(), unreadable=(), selected="27.2"):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        applications = Path(temporary.name)
+        for version in versions:
+            (applications / f"Xcode_{version}.app").mkdir()
+        for name in extra:
+            (applications / name).mkdir()
+        removed_commands = []
+
+        def identity(app):
+            if app.name in unreadable or not app.name.startswith("Xcode"):
+                return None
+            return ("x", "y")
+
+        def command(argv, **kwargs):
+            removed_commands.append(argv)
+            return ""
+
+        current = {"selectedMatches": True, "selected": str(applications / f"Xcode_{selected}.app/Contents/Developer")}
+        with patch.object(controller, "APPLICATIONS", applications), patch.object(controller, "installed_build", side_effect=identity), \
+             patch.object(controller, "report", return_value=current), patch.object(controller, "run", side_effect=command):
+            removed = controller.prune("27.2", "27B52", retain)
+        names = [Path(path).name for path in removed]
+        self.assertEqual([Path(argv[-1]).name for argv in removed_commands], names)
+        self.assertTrue(all(argv[:5] == ["/usr/bin/sudo", "-n", "/bin/rm", "-rf", "--"] for argv in removed_commands))
+        return names
+
+    def test_retain_two_with_exactly_two_removes_nothing(self):
+        self.assertEqual(self.prune(["27.2", "27.0"], 2), [])
+
+    def test_retain_two_with_three_removes_the_oldest(self):
+        self.assertEqual(self.prune(["27.2", "27.0", "26.3"], 2), ["Xcode_26.3.app"])
+
+    def test_versions_compare_numerically(self):
+        self.assertEqual(self.prune(["27.2", "26.9", "26.10"], 2), ["Xcode_26.9.app"])
+
+    def test_retain_one_keeps_only_selected_and_never_plain_xcode(self):
+        self.assertEqual(sorted(self.prune(["27.2", "27.0", "26.3"], 1, extra=["Xcode.app", "Xcode_beta.app"])),
+                         ["Xcode_26.3.app", "Xcode_27.0.app"])
+
+    def test_unreadable_bundle_is_never_removed(self):
+        self.assertEqual(self.prune(["27.2", "27.0", "26.3"], 2, unreadable=["Xcode_26.3.app"]), [])
+
+    def test_prune_refuses_when_pin_is_not_selected(self):
+        with patch.object(controller, "report", return_value={"selectedMatches": False, "selected": "/x"}), \
+             patch.object(controller, "run") as run:
+            with self.assertRaisesRegex(controller.UpdateError, "pruning refused"):
+                controller.prune("27.2", "27B52", 2)
+        run.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()
