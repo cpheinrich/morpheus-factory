@@ -40,6 +40,9 @@ PATH_KEYS = ("factory", "consumer", "hostSetup", "credentialsProject")
 DEFAULT_APPLE = {"idVar": "APPLE_ID", "passwordVar": "APPLE_ID_PASSWORD"}
 MIN_FREE_BYTES = 70 * 1024**3
 SUDOERS_FILE = "/etc/sudoers.d/morpheus-factory"
+# The only command run as root: a root-owned copy of worker/xcode-root-helper.sh.
+HELPER_PATH = "/usr/local/libexec/morpheus-factory-xcode"
+HELPER_SOURCE = Path(__file__).resolve().with_name("xcode-root-helper.sh")
 BUSY_PROCESSES = {"xcodebuild", "swift-frontend", "Runner.Worker"}
 APPLICATIONS = Path("/Applications")
 
@@ -503,28 +506,45 @@ def stage(version, build, stage_root, verification=None, components=(), apple=No
         if actual != (version, build):
             raise UpdateError(f"downloaded Xcode identity {actual} differs from approved pin")
         run(["/usr/sbin/spctl", "--assess", "--type", "execute", str(expanded)])
-        run(["/usr/bin/sudo", "-n", "/bin/mv", str(expanded), str(app)])
+        # /Applications is admin-writable, so the move needs no root.
+        try:
+            run(["/bin/mv", str(expanded), str(app)])
+        except UpdateError as error:
+            raise UpdateError(f"could not move Xcode into {app.parent} without sudo; the login user must be an administrator") from error
     if installed_build(app) != (version, build):
         raise UpdateError("installed Xcode did not retain the approved identity")
-    run(["/usr/bin/sudo", "-n", str(app / "Contents/Developer/usr/bin/xcodebuild"), "-license", "accept"])
-    run(["/usr/bin/sudo", "-n", str(app / "Contents/Developer/usr/bin/xcodebuild"), "-runFirstLaunch"], capture=False)
+    root_helper("first-launch", app, capture=False)
     ensure_components(app, components)
     return "staged"
+
+
+def root_helper(verb, app, capture=True):
+    return run(["/usr/bin/sudo", "-n", HELPER_PATH, verb, str(app)], capture=capture)
+
+
+def host_is_busy():
+    # A busy machine is not a safe place to change the system-wide selection.
+    # A GitHub Actions job can sit between build steps with no compiler
+    # running, so a live Runner.Worker counts too. That process is the child
+    # `launchctl print gui/<uid>/<runner label>` would show, so this one check
+    # also covers the configured runner LaunchAgent.
+    process_list = run(["/bin/ps", "-axo", "comm="])
+    return any(Path(line.strip()).name in BUSY_PROCESSES for line in process_list.splitlines())
+
+
+def developer_app(developer):
+    """The app bundle a developer directory belongs to, or None."""
+    return Path(developer).parents[1] if developer.endswith(".app/Contents/Developer") else None
 
 
 def activate(version, build):
     app = matching_app(version, build)
     if app is None:
         raise UpdateError("approved Xcode is not installed; activation refused")
-    # A busy machine is not a safe place to change the system-wide selection.
-    # A GitHub Actions job can sit between build steps with no compiler
-    # running, so a live Runner.Worker defers too. That process is the child
-    # `launchctl print gui/<uid>/<runner label>` would show, so this one check
-    # also covers the configured runner LaunchAgent.
-    process_list = run(["/bin/ps", "-axo", "comm="])
-    if any(Path(line.strip()).name in BUSY_PROCESSES for line in process_list.splitlines()):
+    # Checked again here: a job may have started during validation.
+    if host_is_busy():
         raise UpdateError("Xcode build or runner job is active; activation deferred")
-    run(["/usr/bin/sudo", "-n", "/usr/bin/xcode-select", "--switch", str(app / "Contents/Developer")])
+    root_helper("select", app)
     if not report(version, build)["selectedMatches"]:
         raise UpdateError("xcode-select did not select the approved Xcode")
     return "activated"
@@ -545,13 +565,17 @@ def validate(version, build, checks):
     return "validated"
 
 
-def reconcile(version, build, checks, phase, stage_root, verification=None, components=(), apple=None):
-    before = report(version, build)
+def reconcile(version, build, checks, phase, stage_root, verification=None, components=(), apple=None, before=None):
+    before = before or report(version, build)
     stage(version, build, stage_root, verification, components, apple)
     if phase == "stage":
         return "staged"
     if before["selectedMatches"]:
         return "already-current"
+    # Do not run a long validation build beside a live job only for activation
+    # to refuse afterwards; the next tick retries.
+    if host_is_busy():
+        return "deferred-busy"
     validate(version, build, checks)
     previous = before["selected"]
     try:
@@ -559,7 +583,10 @@ def reconcile(version, build, checks, phase, stage_root, verification=None, comp
     except UpdateError:
         # If a switch succeeded but verification failed, restore the prior toolchain.
         if run(["/usr/bin/xcode-select", "-p"]) != previous:
-            run(["/usr/bin/sudo", "-n", "/usr/bin/xcode-select", "--switch", previous])
+            previous_app = developer_app(previous)
+            if previous_app is None:
+                raise UpdateError(f"cannot restore {previous}: it is not inside an Xcode app") from None
+            root_helper("select", previous_app)
         raise
     return "promoted"
 
@@ -568,16 +595,28 @@ def version_key(version):
     return tuple(int(part) for part in version.split("."))
 
 
-def prune(version, build, retain):
-    """Keep the selected Xcode plus the newest others up to `retain` in total."""
+def prune(version, build, retain, previous=None):
+    """Keep `retain` Xcode bundles: protected ones first, then the newest others.
+
+    Protected: the selected app, the app selected before this reconcile, and
+    the target of an /Applications/Xcode.app symlink.
+    """
+    if host_is_busy():
+        return []
     current = report(version, build)
     if not current["selectedMatches"]:
         raise UpdateError("approved Xcode is not selected; pruning refused")
-    keep = {app_path(version), Path(current["selected"]).parents[1]}
+    protected = {app_path(version), developer_app(current["selected"])}
+    if previous:
+        protected.add(developer_app(previous))
+    plain = APPLICATIONS / "Xcode.app"
+    if plain.is_symlink():
+        protected.add(plain.resolve())
+    protected = {app.resolve() for app in protected if app is not None and app.exists()}
     candidates = []
     for app in APPLICATIONS.glob("Xcode_*.app"):
         match = re.fullmatch(r"Xcode_([0-9]+(?:\.[0-9]+){1,2})\.app", app.name)
-        if match is None or app in keep or app.is_symlink():
+        if match is None or app.is_symlink() or app.resolve() in protected:
             continue
         try:
             identity = installed_build(app)
@@ -588,29 +627,10 @@ def prune(version, build, retain):
             candidates.append((version_key(match.group(1)), app))
     candidates.sort(reverse=True)
     removed = []
-    for _, app in candidates[retain - 1:]:
-        run(["/usr/bin/sudo", "-n", "/bin/rm", "-rf", "--", str(app)])
+    for _, app in candidates[max(0, retain - len(protected)):]:
+        root_helper("remove", app)
         removed.append(str(app))
     return removed
-
-
-def sudo_probes(version):
-    app = app_path(version)
-    xcodebuild = str(app / "Contents/Developer/usr/bin/xcodebuild")
-    return [
-        ["/bin/mv"],
-        ["/usr/bin/xcode-select", "--switch", str(app / "Contents/Developer")],
-        ["/bin/rm", "-rf", "--", str(app)],
-        [xcodebuild, "-license", "accept"],
-        [xcodebuild, "-runFirstLaunch"],
-    ]
-
-
-def sudoers_line(version):
-    xcodebuild = app_path(version) / "Contents/Developer/usr/bin/xcodebuild"
-    user = os.environ.get("USER") or "<user>"
-    return (f"{user} ALL=(root) NOPASSWD: /bin/mv, /usr/bin/xcode-select --switch *, "
-            f"/bin/rm -rf -- /Applications/Xcode_*.app, {xcodebuild} -license accept, {xcodebuild} -runFirstLaunch")
 
 
 def check_xcodes(pin):
@@ -628,17 +648,36 @@ def check_disk(pin):
     return True, f"{gib} GiB free on /Applications"
 
 
+def helper_install_commands():
+    user = os.environ.get("USER") or "<user>"
+    return (f"sudo install -o root -g wheel -m 755 {HELPER_SOURCE} {HELPER_PATH}; then add this line with "
+            f"sudo visudo -f {SUDOERS_FILE}: {user} ALL=(root) NOPASSWD: {HELPER_PATH}")
+
+
+def helper_status():
+    return os.stat(HELPER_PATH)
+
+
 def check_sudo(pin):
-    missing = []
-    for argv in sudo_probes(pin.version):
-        try:
-            run(["/usr/bin/sudo", "-n", "-l", *argv])
-        except UpdateError:
-            missing.append(" ".join(argv))
-    if missing:
-        return False, (f"sudo -n refused: {'; '.join(missing)}. Add this line to {SUDOERS_FILE} "
-                       f"(visudo -f {SUDOERS_FILE}): {sudoers_line(pin.version)}")
-    return True, "sudo -n allows every staging and activation command"
+    problems = []
+    try:
+        status = helper_status()
+    except FileNotFoundError:
+        problems.append(f"{HELPER_PATH} is not installed")
+    else:
+        if status.st_uid != 0:
+            problems.append(f"{HELPER_PATH} is not owned by root")
+        if status.st_mode & 0o022:
+            problems.append(f"{HELPER_PATH} is group- or other-writable")
+        if hashlib.sha256(Path(HELPER_PATH).read_bytes()).digest() != hashlib.sha256(HELPER_SOURCE.read_bytes()).digest():
+            problems.append(f"{HELPER_PATH} differs from {HELPER_SOURCE.name}; reinstall it")
+    try:
+        run(["/usr/bin/sudo", "-n", "-l", HELPER_PATH])
+    except UpdateError:
+        problems.append(f"sudo -n does not allow {HELPER_PATH}")
+    if problems:
+        return False, f"{'; '.join(problems)}. Install: {helper_install_commands()}"
+    return True, f"{HELPER_PATH} is root-owned, current, and allowed by sudo -n"
 
 
 def check_apple(pin):
@@ -879,9 +918,10 @@ def main():
         elif args.command == "validate":
             result = validate(version, build, checks)
         elif args.command == "reconcile":
-            result = reconcile(version, build, checks, phase, state_dir, verification, components, apple)
+            before = report(version, build)
+            result = reconcile(version, build, checks, phase, state_dir, verification, components, apple, before=before)
             if result in ("promoted", "already-current"):
-                extra["removed"] = prune(version, build, pin.retain)
+                extra["removed"] = prune(version, build, pin.retain, before["selected"])
         else:
             result = activate(version, build)
         print(json.dumps({"result": result, "host": args.host, "xcode": {"version": version, "build": build}, **extra}))

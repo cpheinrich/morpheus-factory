@@ -5,7 +5,7 @@ and build pinned in the reviewed manifest `worker/updates.json`. It never infers
 "latest" and never edits a consumer's CI pins. `stage` downloads and installs a
 side-by-side `/Applications/Xcode_<version>.app`; promotion runs the host's
 declared validation with `DEVELOPER_DIR` set to that app, then switches the
-command-line default with `sudo -n xcode-select --switch`. Validation commands
+command-line default through the root helper (below). Validation commands
 are `argv` arrays, never shell text, and execute on the host, so the manifest
 must come from protected main.
 
@@ -68,16 +68,11 @@ check fails. A check that cannot determine its answer reports `ok: false` with
 1. `xcodes` — on `PATH`.
 2. `disk` — at least 70 GiB free on `/Applications` unless the pinned app is
    already installed.
-3. `sudo` — `sudo -n -l` allows each exact command staging, activation and
-   pruning use. Add the line the detail prints to `/etc/sudoers.d/morpheus-factory`
-   with `visudo -f`; it has this form:
-
-   ```
-   <user> ALL=(root) NOPASSWD: /bin/mv, /usr/bin/xcode-select --switch *, /bin/rm -rf -- /Applications/Xcode_*.app, /Applications/Xcode_<v>.app/Contents/Developer/usr/bin/xcodebuild -license accept, /Applications/Xcode_<v>.app/Contents/Developer/usr/bin/xcodebuild -runFirstLaunch
-   ```
-
-   Unrestricted `mv` makes this root-equivalent for that login, so grant it only
-   to the host's own automation user. A new Xcode version needs the line updated.
+3. `sudo` — the root helper is installed at `/usr/local/libexec/morpheus-factory-xcode`,
+   owned by root, not group- or other-writable, byte-identical (sha256) to
+   `worker/xcode-root-helper.sh`, and `sudo -n -l` allows it. The detail prints
+   the install commands (see [Root helper](#root-helper)). A changed checksum
+   means the helper was updated in the repository and must be reinstalled.
 4. `apple-credentials` — both configured variables are set and nonempty. Only the
    names are printed.
 5. `verification-provider` (hosts with `verification`) —
@@ -115,8 +110,49 @@ check fails. A check that cannot determine its answer reports `ok: false` with
 `stage`, `image-stage` and `reconcile` run the install checks first (`xcodes`,
 `disk`, `sudo`, `apple-credentials`, `verification-provider` when configured,
 `paths`) and refuse with `preflight: <failed names>` before any download, so a
-missing sudo rule or credential no longer surfaces after a multi-GB fetch. Run
+missing root helper or credential no longer surfaces after a multi-GB fetch. Run
 `check` for the details.
+
+## Root helper
+
+Only one command runs as root: `worker/xcode-root-helper.sh`, installed once by
+the operator as a root-owned copy and allowed by a single sudoers line:
+
+```sh
+sudo install -o root -g wheel -m 755 worker/xcode-root-helper.sh /usr/local/libexec/morpheus-factory-xcode
+sudo visudo -f /etc/sudoers.d/morpheus-factory
+#   <user> ALL=(root) NOPASSWD: /usr/local/libexec/morpheus-factory-xcode
+```
+
+Rerun the `install` line whenever the helper changes; `check` compares checksums
+and reports a stale copy.
+
+Why a helper rather than sudoers rules for the individual commands: every such
+rule was root-equivalent. A bare `/bin/mv` allows any move as root. Sudoers
+matches `*` against the whole concatenated argument string, so
+`/bin/rm -rf -- /Applications/Xcode_*.app` also matches extra arguments, and
+`xcode-select --switch *` accepts any directory. A rule naming
+`/Applications/Xcode_<v>.app/.../xcodebuild` lets anyone who can write
+`/Applications` (every admin) plant a bundle at that path and run it as root.
+
+The helper takes exactly one verb and one app path (anything else exits 2) and
+refuses with exit 1 and a one-line reason before acting:
+
+| Verb | Accepts | Does |
+|---|---|---|
+| `select <app>` | `/Applications/Xcode.app` or `/Applications/Xcode_<version>.app` | `xcode-select --switch <app>/Contents/Developer` |
+| `first-launch <app>` | `/Applications/Xcode_<version>.app` | `xcodebuild -license accept`, then `-runFirstLaunch` |
+| `remove <app>` | `/Applications/Xcode_<version>.app` | `rm -rf -- <app>` |
+
+The path must be a real directory, not a symlink. `select` and `first-launch`
+require `spctl --assess --type execute` to pass, so only an Apple-signed bundle
+runs as root. `remove` refuses the app `xcode-select -p` points into and the
+target of an `/Applications/Xcode.app` symlink. The helper calls its tools by
+absolute path and never relies on `PATH`.
+
+Moving the expanded app into `/Applications` needs no root because the folder is
+admin-writable; the login user must be an administrator, and `stage` refuses
+with that message if the move fails.
 
 ## Credentials
 
@@ -201,22 +237,27 @@ needed only on the SMS reader host, never on Factory hosts.
 
 The controller allows one update at a time, refuses an existing app with a
 conflicting build, checks the downloaded app's exact version/build and macOS
-security assessment, and validates before switching. **Activation defers** while
-`xcodebuild`, `swift-frontend` or a GitHub Actions `Runner.Worker` is running: a
-job can sit between build steps with no compiler running, and switching then
-would change the toolchain mid-job. An idle `Runner.Listener` does not defer. If
-post-switch verification fails the controller restores the previous selected
-developer directory. An Xcode update can require a new simulator runtime; the
+security assessment, and validates before switching. **A busy host defers**:
+while `xcodebuild`, `swift-frontend` or a GitHub Actions `Runner.Worker` is
+running, `reconcile` returns `deferred-busy` *before* the validation build (so the
+Pro does not run a device build beside a live delivery job), `activate` checks
+again right before switching, and pruning does nothing. A job can sit between
+build steps with no compiler running, and switching then would change the
+toolchain mid-job. An idle `Runner.Listener` does not defer. If post-switch
+verification fails the controller selects the previous app again through the
+helper; a previous selection outside an Xcode app (such as the Command Line
+Tools) cannot be restored and is reported. An Xcode update can require a new simulator runtime; the
 validation command must cover the consumer's actual build destination.
 
 **Pruning.** After a successful promotion, and on every `already-current`
-reconcile, the controller keeps the selected Xcode plus the newest other
-`/Applications/Xcode_<version>.app` bundles up to `xcode.retain` in total
-(default 2: the selected one and one rollback), comparing versions numerically.
-It removes the rest with `sudo -n /bin/rm -rf --`, listing them under `removed`
-in the result. It only considers `Xcode_<version>.app` bundles whose
-`xcodebuild -version` it can read, and never removes `/Applications/Xcode.app` or
-the selected app. Simulator runtimes are never deleted.
+reconcile on an idle host, the controller keeps `xcode.retain` Xcode bundles in
+total (default 2). It always keeps the selected app, the app selected before this
+reconcile (the rollback), and the target of an `/Applications/Xcode.app` symlink;
+remaining slots go to the newest other `/Applications/Xcode_<version>.app`
+bundles, compared numerically. It removes the rest with the helper's `remove`,
+listing them under `removed` in the result. It only considers
+`Xcode_<version>.app` bundles whose `xcodebuild -version` it can read, and never
+removes `/Applications/Xcode.app`. Simulator runtimes are never deleted.
 
 ## CI images (ci-image hosts)
 

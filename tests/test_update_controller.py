@@ -128,16 +128,82 @@ class UpdateControllerTests(unittest.TestCase):
         def command(argv, **kwargs):
             if argv == ["/usr/bin/xcode-select", "-p"]:
                 return selected
-            if argv == ["/usr/bin/sudo", "-n", "/usr/bin/xcode-select", "--switch", previous]:
+            if argv == ["/usr/bin/sudo", "-n", controller.HELPER_PATH, "select", "/Applications/Xcode.app"]:
                 return ""
             raise AssertionError(argv)
         with patch.object(controller, "report", return_value={"selected": previous, "selectedMatches": False}), \
-             patch.object(controller, "stage"), patch.object(controller, "validate"), \
+             patch.object(controller, "stage"), patch.object(controller, "validate"), patch.object(controller, "host_is_busy", return_value=False), \
              patch.object(controller, "activate", side_effect=controller.UpdateError("post-switch check failed")), \
              patch.object(controller, "run", side_effect=command) as run:
             with self.assertRaisesRegex(controller.UpdateError, "post-switch check failed"):
                 controller.reconcile("27.2", "27B52", [], "promote", Path("/tmp/state"))
-        run.assert_any_call(["/usr/bin/sudo", "-n", "/usr/bin/xcode-select", "--switch", previous])
+        self.assertIn(["/usr/bin/sudo", "-n", controller.HELPER_PATH, "select", "/Applications/Xcode.app"], [c.args[0] for c in run.call_args_list])
+
+    def test_rollback_refuses_a_previous_selection_outside_an_app(self):
+        def command(argv, **kwargs):
+            if argv == ["/usr/bin/xcode-select", "-p"]:
+                return "/Applications/Xcode_27.2.app/Contents/Developer"
+            raise AssertionError(argv)
+        with patch.object(controller, "report", return_value={"selected": "/Library/Developer/CommandLineTools", "selectedMatches": False}), \
+             patch.object(controller, "stage"), patch.object(controller, "validate"), patch.object(controller, "host_is_busy", return_value=False), \
+             patch.object(controller, "activate", side_effect=controller.UpdateError("post-switch check failed")), \
+             patch.object(controller, "run", side_effect=command):
+            with self.assertRaisesRegex(controller.UpdateError, "cannot restore /Library/Developer/CommandLineTools"):
+                controller.reconcile("27.2", "27B52", [], "promote", Path("/tmp/state"))
+
+    def test_busy_host_defers_before_the_validation_build(self):
+        with patch.object(controller, "report", return_value={"selected": "/Applications/Xcode.app/Contents/Developer", "selectedMatches": False}), \
+             patch.object(controller, "stage"), patch.object(controller, "validate") as validate, \
+             patch.object(controller, "activate") as activate, \
+             patch.object(controller, "run", return_value="/sbin/launchd\n/Users/chris/actions-runner/bin/Runner.Worker\n"):
+            result = controller.reconcile("27.2", "27B52", [], "promote", Path("/tmp/state"))
+        self.assertEqual(result, "deferred-busy")
+        validate.assert_not_called()
+        activate.assert_not_called()
+
+    def test_stage_moves_without_sudo_and_first_launches_through_helper(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        applications = root / "Applications"
+        applications.mkdir()
+        commands = []
+        moved = []
+
+        def command(argv, **kwargs):
+            commands.append(argv)
+            if argv[0] == "/usr/bin/xip":
+                (kwargs["cwd"] / "Xcode.app").mkdir()
+            if argv[0] == "/bin/mv":
+                if moved == ["fail"]:
+                    raise controller.UpdateError("mv exited 1")
+                Path(argv[1]).rename(argv[2])
+            return ""
+
+        def download(argv, verification, apple):
+            (Path(argv[-1]) / "Xcode_27.2.xip").write_text("")
+
+        identity = lambda app: ("27.2", "27B52") if app.exists() else None
+        with patch.object(controller, "APPLICATIONS", applications), patch.object(controller, "matching_app", return_value=None), \
+             patch.object(controller, "installed_build", side_effect=identity), patch.object(controller, "run", side_effect=command), \
+             patch.object(controller, "run_xcodes", side_effect=download), patch.object(controller, "ensure_components"), \
+             patch.object(controller.shutil, "which", return_value="/opt/homebrew/bin/xcodes"), \
+             patch.object(controller.shutil, "disk_usage", return_value=SimpleNamespace(free=80 * 1024**3)):
+            self.assertEqual(controller.stage("27.2", "27B52", root / "state"), "staged")
+            app = str(applications / "Xcode_27.2.app")
+            self.assertEqual([argv for argv in commands if "sudo" in argv[0]], [["/usr/bin/sudo", "-n", controller.HELPER_PATH, "first-launch", app]])
+            self.assertIn(["/bin/mv", str(next(iter(argv[1] for argv in commands if argv[0] == "/bin/mv"))), app], commands)
+            Path(app).rmdir()
+            moved.append("fail")
+            commands.clear()
+            with self.assertRaisesRegex(controller.UpdateError, "without sudo; the login user must be an administrator"):
+                controller.stage("27.2", "27B52", root / "state")
+            self.assertFalse(any("sudo" in argv[0] for argv in commands))
+
+    def test_only_helper_invocations_use_sudo(self):
+        lines = [line for line in SCRIPT.read_text().splitlines() if '"/usr/bin/sudo"' in line]
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all("HELPER_PATH" in line for line in lines))
 
     def test_ci_image_requires_exact_guest_proof_and_caches_only_unchanged_image(self):
         temporary = tempfile.TemporaryDirectory()
@@ -363,7 +429,10 @@ class FakeHost:
         self.pin = controller.pin_for_host(manifest, "pro")
         self.free = 70 * 1024**3
         self.installed = None
-        self.sudo_refused = set()
+        self.sudo_refused = False
+        self.helper = self.root / "morpheus-factory-xcode"
+        self.helper.write_bytes(controller.HELPER_SOURCE.read_bytes())
+        self.helper_stat = SimpleNamespace(st_uid=0, st_mode=0o100755)
         self.identities = [(FINGERPRINT_A, "Apple Development: Chris (266U7M6NPQ)", "TAML3DQJTR"),
                            (FINGERPRINT_B, "Apple Development: chris@example.test (BB58HPM92M)", "D495224G8R")]
         self.device_state = "connected"
@@ -376,7 +445,7 @@ class FakeHost:
     def run(self, argv, **kwargs):
         self.commands.append(argv)
         if argv[:3] == ["/usr/bin/sudo", "-n", "-l"]:
-            if argv[3] in self.sudo_refused:
+            if self.sudo_refused:
                 raise controller.UpdateError("sudo exited 1")
             return argv[3]
         if argv[:2] == ["/usr/bin/security", "find-identity"]:
@@ -390,6 +459,11 @@ class FakeHost:
                     f"Phone   phone.local   {UDID} (UDID)   {self.device_state}   iPhone 15 Pro (iPhone16,1)\n"
                     "Sim      5267E2AE-9663-4E13-A209-6FD35BB5F699 (UDID)   shutdown   iPhone 17 Pro")
         raise AssertionError(argv)
+
+    def status(self):
+        if self.helper_stat is None:
+            raise FileNotFoundError(str(self.helper))
+        return self.helper_stat
 
     def gh_run(self, argv, **kwargs):
         self.commands.append(argv)
@@ -406,6 +480,8 @@ class FakeHost:
              patch.object(controller.shutil, "disk_usage", return_value=SimpleNamespace(free=self.free)), \
              patch.object(controller, "matching_app", return_value=self.installed), \
              patch.object(controller, "certificate_team", side_effect=team), \
+             patch.object(controller, "HELPER_PATH", str(self.helper)), \
+             patch.object(controller, "helper_status", side_effect=self.status), \
              patch.object(controller.subprocess, "run", side_effect=self.gh_run), \
              patch.object(controller, "run", side_effect=self.run):
             yield
@@ -430,10 +506,7 @@ class CheckTests(unittest.TestCase):
         self.assertIn(FINGERPRINT_A, checks["signing"]["detail"])
         self.assertEqual(checks["device"]["detail"], f"{UDID} is connected")
         sudo = [argv[3:] for argv in host.commands if argv[:3] == ["/usr/bin/sudo", "-n", "-l"]]
-        xcodebuild = "/Applications/Xcode_27.2.app/Contents/Developer/usr/bin/xcodebuild"
-        self.assertEqual(sudo, [["/bin/mv"], ["/usr/bin/xcode-select", "--switch", "/Applications/Xcode_27.2.app/Contents/Developer"],
-                                ["/bin/rm", "-rf", "--", "/Applications/Xcode_27.2.app"],
-                                [xcodebuild, "-license", "accept"], [xcodebuild, "-runFirstLaunch"]])
+        self.assertEqual(sudo, [[str(host.helper)]])
 
     def test_disk_boundary_and_installed_app(self):
         host = FakeHost(self)
@@ -442,16 +515,32 @@ class CheckTests(unittest.TestCase):
         host.installed = Path("/Applications/Xcode_27.2.app")
         self.assertEqual(host.checks()["disk"], {"name": "disk", "ok": True, "detail": "pinned Xcode is already installed"})
 
-    def test_refused_sudo_names_the_sudoers_line(self):
+    def test_refused_sudo_prints_the_install_commands(self):
         host = FakeHost(self)
-        host.sudo_refused = {"/bin/rm"}
+        host.sudo_refused = True
         checks = host.checks()
         self.assertEqual(self.failing(host), ["sudo"])
         detail = checks["sudo"]["detail"]
-        self.assertIn("/etc/sudoers.d/morpheus-factory", detail)
-        self.assertIn("chris ALL=(root) NOPASSWD: /bin/mv, /usr/bin/xcode-select --switch *, /bin/rm -rf -- /Applications/Xcode_*.app, "
-                      "/Applications/Xcode_27.2.app/Contents/Developer/usr/bin/xcodebuild -license accept, "
-                      "/Applications/Xcode_27.2.app/Contents/Developer/usr/bin/xcodebuild -runFirstLaunch", detail)
+        self.assertIn(f"sudo -n does not allow {host.helper}", detail)
+        self.assertIn(f"sudo install -o root -g wheel -m 755 {controller.HELPER_SOURCE} {host.helper}", detail)
+        self.assertIn(f"sudo visudo -f /etc/sudoers.d/morpheus-factory: chris ALL=(root) NOPASSWD: {host.helper}", detail)
+
+    def test_helper_must_be_root_owned_unwritable_and_current(self):
+        host = FakeHost(self)
+        host.helper_stat = SimpleNamespace(st_uid=501, st_mode=0o100755)
+        self.assertIn("is not owned by root", host.checks()["sudo"]["detail"])
+        for mode in (0o100775, 0o100757):
+            host.helper_stat = SimpleNamespace(st_uid=0, st_mode=mode)
+            self.assertEqual(self.failing(host), ["sudo"])
+            self.assertIn("group- or other-writable", host.checks()["sudo"]["detail"])
+        host.helper_stat = SimpleNamespace(st_uid=0, st_mode=0o100755)
+        host.helper.write_bytes(controller.HELPER_SOURCE.read_bytes() + b"# changed\n")
+        self.assertEqual(self.failing(host), ["sudo"])
+        self.assertIn("differs from xcode-root-helper.sh; reinstall it", host.checks()["sudo"]["detail"])
+        host.helper.unlink()
+        host.helper_stat = None
+        self.assertEqual(self.failing(host), ["sudo"])
+        self.assertIn(f"{host.helper} is not installed", host.checks()["sudo"]["detail"])
 
     def test_missing_credentials_print_names_never_values(self):
         host = FakeHost(self)
@@ -603,7 +692,7 @@ class CheckTests(unittest.TestCase):
 class PreflightTests(unittest.TestCase):
     def test_stage_refuses_before_download_when_preflight_fails(self):
         host = FakeHost(self)
-        host.sudo_refused = {"/bin/mv"}
+        host.sudo_refused = True
         state = host.root / "state"
         argv = ["update_controller.py", "stage", "--host", "pro", "--manifest", str(host.manifest), "--state-dir", str(state)]
         with patch.object(sys, "argv", argv), host.patched(), \
@@ -634,16 +723,18 @@ class PreflightTests(unittest.TestCase):
         output = io.StringIO()
         argv = ["update_controller.py", "reconcile", "--host", "pro", "--manifest", str(host.manifest), "--state-dir", str(host.root / "state")]
         with patch.object(sys, "argv", argv), redirect_stdout(output), patch.object(controller, "preflight"), \
+             patch.object(controller, "report", return_value={"selected": "/Applications/Xcode.app/Contents/Developer", "selectedMatches": False}), \
              patch.object(controller, "reconcile", return_value="promoted"), \
              patch.object(controller, "prune", return_value=["/Applications/Xcode_26.3.app"]) as prune:
             self.assertEqual(controller.main(), 0)
-        prune.assert_called_once_with("27.2", "27B52", 2)
+        prune.assert_called_once_with("27.2", "27B52", 2, "/Applications/Xcode.app/Contents/Developer")
         self.assertEqual(json.loads(output.getvalue())["removed"], ["/Applications/Xcode_26.3.app"])
 
     def test_staged_hold_does_not_prune(self):
         host = FakeHost(self)
         argv = ["update_controller.py", "reconcile", "--host", "pro", "--manifest", str(host.manifest), "--state-dir", str(host.root / "state")]
         with patch.object(sys, "argv", argv), redirect_stdout(io.StringIO()), patch.object(controller, "preflight"), \
+             patch.object(controller, "report", return_value={"selected": "/x", "selectedMatches": False}), \
              patch.object(controller, "reconcile", return_value="staged"), patch.object(controller, "prune") as prune:
             controller.main()
         prune.assert_not_called()
@@ -672,19 +763,21 @@ class ActivateTests(unittest.TestCase):
     def test_idle_runner_listener_does_not_defer(self):
         result, commands = self.activate("/sbin/launchd\n/Users/chris/actions-runner/bin/Runner.Listener\n")
         self.assertEqual(result, "activated")
-        self.assertIn(["/usr/bin/sudo", "-n", "/usr/bin/xcode-select", "--switch", "/Applications/Xcode_27.2.app/Contents/Developer"], commands)
+        self.assertIn(["/usr/bin/sudo", "-n", controller.HELPER_PATH, "select", "/Applications/Xcode_27.2.app"], commands)
 
 
 class PruneTests(unittest.TestCase):
-    def prune(self, versions, retain, extra=(), unreadable=(), selected="27.2"):
+    def prune(self, versions, retain, extra=(), unreadable=(), selected="27.2", previous=None, symlink=None, busy=False):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        applications = Path(temporary.name)
+        applications = Path(temporary.name).resolve()
         for version in versions:
             (applications / f"Xcode_{version}.app").mkdir()
         for name in extra:
             (applications / name).mkdir()
-        removed_commands = []
+        if symlink:
+            (applications / "Xcode.app").symlink_to(applications / f"Xcode_{symlink}.app")
+        commands = []
 
         def identity(app):
             if app.name in unreadable or not app.name.startswith("Xcode"):
@@ -692,16 +785,19 @@ class PruneTests(unittest.TestCase):
             return ("x", "y")
 
         def command(argv, **kwargs):
-            removed_commands.append(argv)
+            commands.append(argv)
+            if argv[0] == "/bin/ps":
+                return "/sbin/launchd\n" + ("/opt/runner/bin/Runner.Worker\n" if busy else "/opt/runner/bin/Runner.Listener\n")
             return ""
 
         current = {"selectedMatches": True, "selected": str(applications / f"Xcode_{selected}.app/Contents/Developer")}
+        before = None if previous is None else str(applications / f"Xcode_{previous}.app/Contents/Developer")
         with patch.object(controller, "APPLICATIONS", applications), patch.object(controller, "installed_build", side_effect=identity), \
              patch.object(controller, "report", return_value=current), patch.object(controller, "run", side_effect=command):
-            removed = controller.prune("27.2", "27B52", retain)
+            removed = controller.prune("27.2", "27B52", retain, before)
+        helper = [argv for argv in commands if argv[0] != "/bin/ps"]
         names = [Path(path).name for path in removed]
-        self.assertEqual([Path(argv[-1]).name for argv in removed_commands], names)
-        self.assertTrue(all(argv[:5] == ["/usr/bin/sudo", "-n", "/bin/rm", "-rf", "--"] for argv in removed_commands))
+        self.assertEqual(helper, [["/usr/bin/sudo", "-n", controller.HELPER_PATH, "remove", path] for path in removed])
         return names
 
     def test_retain_two_with_exactly_two_removes_nothing(self):
@@ -717,15 +813,29 @@ class PruneTests(unittest.TestCase):
         self.assertEqual(sorted(self.prune(["27.2", "27.0", "26.3"], 1, extra=["Xcode.app", "Xcode_beta.app"])),
                          ["Xcode_26.3.app", "Xcode_27.0.app"])
 
+    def test_previously_selected_app_is_kept_over_a_newer_leftover(self):
+        self.assertEqual(self.prune(["27.2", "27.0", "26.3"], 2, previous="26.3"), ["Xcode_27.0.app"])
+
+    def test_previous_selection_counts_toward_retain(self):
+        self.assertEqual(sorted(self.prune(["27.2", "27.1", "27.0", "26.3"], 3, previous="26.3")), ["Xcode_27.0.app"])
+
+    def test_xcode_symlink_target_is_protected(self):
+        self.assertEqual(self.prune(["27.2", "27.0", "26.3"], 2, symlink="26.3"), ["Xcode_27.0.app"])
+        self.assertEqual(self.prune(["27.2", "27.0", "26.3"], 1, symlink="26.3"), ["Xcode_27.0.app"])
+
+    def test_busy_host_prunes_nothing(self):
+        self.assertEqual(self.prune(["27.2", "27.0", "26.3"], 1, busy=True), [])
+
     def test_unreadable_bundle_is_never_removed(self):
         self.assertEqual(self.prune(["27.2", "27.0", "26.3"], 2, unreadable=["Xcode_26.3.app"]), [])
 
     def test_prune_refuses_when_pin_is_not_selected(self):
         with patch.object(controller, "report", return_value={"selectedMatches": False, "selected": "/x"}), \
-             patch.object(controller, "run") as run:
+             patch.object(controller, "host_is_busy", return_value=False), patch.object(controller, "root_helper") as helper:
             with self.assertRaisesRegex(controller.UpdateError, "pruning refused"):
                 controller.prune("27.2", "27B52", 2)
-        run.assert_not_called()
+        helper.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
