@@ -39,6 +39,15 @@ bootstrap a one-shot LaunchAgent into `gui/<uid>` with `launchctl bootstrap` and
 read its log; a `reconcile` run directly from an SSH shell will fail validation
 on every phone-gate host.
 
+**A consumer's derived data outlives the switch.** Promotion changes the
+selected Xcode, not the consumer's persistent build directories: on the Pro
+(2026-10-31) the runner's `/tmp/EvoDerivedData-<checkout-hash>/Build/Products`
+kept a 26.6 `*_iphoneos26.5-arm64.xctestrun` beside the new 27.2 one, and the
+device gate's "exactly one xctestrun" check failed on the first delivery after
+the switch. The consumer's build script owns that directory and must clear stale
+products before `build-for-testing` (Evo's fix is in its `dev.sh`); the Factory's
+own validation is unaffected because it builds in a fresh detached worktree.
+
 **Staging defers while CI is busy.** First launch and component installs rewrite shared system frameworks under any running `xcodebuild` (on the Pro, 2026-10-31, this killed a running CD phone gate). `stage` returns `deferred-busy` while a runner job or build is live, downloads only on an idle host, and waits for idle again (up to two hours) right before the root helper's first launch; components on an already-installed host are likewise skipped while busy and repaired on a later run. `xcodebuild -downloadComponent` leaves helper `xcodebuild` processes alive for a moment after it returns, so promotion waits up to a 60-second settle window for the host to go idle before deferring; a real job holds `Runner.Worker` far longer than that.
 
 ## Manifest fields
