@@ -374,6 +374,74 @@ class XcodesErrorTests(unittest.TestCase):
         self.assertNotIn("secret-ish", str(caught.exception))
 
 
+FAKE_XCODES = r"""
+import sys, termios, time
+def hidden_readline(prompt):
+    # readpassphrase(3): print the prompt, then TCSAFLUSH the terminal (dropping queued input), then read.
+    sys.stdout.write(prompt); sys.stdout.flush()
+    time.sleep(0.3)
+    attrs = termios.tcgetattr(0); attrs[3] &= ~termios.ECHO
+    termios.tcsetattr(0, termios.TCSAFLUSH, attrs)
+    line = sys.stdin.readline().strip()
+    attrs[3] |= termios.ECHO; termios.tcsetattr(0, termios.TCSANOW, attrs)
+    return line
+print("Two-factor authentication is enabled for this account.\n")
+print('Enter "sms" without quotes to exit this prompt and choose a phone number to send an SMS security code to.')
+if hidden_readline("Enter the 6 digit code from one of your trusted devices:") != "sms": sys.exit(3)
+print("Select a trusted phone number to receive a code via SMS:"); print("1: +1 (•••) •••-••12"); sys.stdout.flush()
+if sys.stdin.readline().strip() != "1": sys.exit(4)
+if hidden_readline("Enter the 6 digit code sent to +1 (•••) •••-••12:") != "123456": sys.exit(5)
+print("downloaded"); sys.exit(0)
+"""
+
+
+class HiddenPromptTests(unittest.TestCase):
+    """xcodes reads 2FA answers with readpassphrase, whose TCSAFLUSH drops input queued before it runs."""
+
+    def test_full_sms_flow_against_a_readpassphrase_like_child(self):
+        with patch.object(controller, "xcodes_environment", return_value={"PATH": os.environ.get("PATH", "")}), \
+             patch.object(controller, "request_verification_code", return_value="123456"), \
+             patch.dict(os.environ, {"FACTORY_VERIFICATION_CODE_COMMAND": "/usr/bin/true"}):
+            result, started = controller._xcodes_interactive_attempt([sys.executable, "-c", FAKE_XCODES], {"purpose": "p", "account": "a"}, 5, None)
+        self.assertEqual(result, "xcodes-complete")
+        self.assertIsNotNone(started)
+
+    def test_immediate_write_is_lost_but_waiting_for_echo_off_is_not(self):
+        import pty as _pty, termios as _termios
+        child = r"""
+import sys, termios, time
+sys.stdout.write("prompt:"); sys.stdout.flush(); time.sleep(0.3)
+a = termios.tcgetattr(0); a[3] &= ~termios.ECHO; termios.tcsetattr(0, termios.TCSAFLUSH, a)
+sys.stdout.write("got=" + sys.stdin.readline().strip() + "\n"); sys.stdout.flush()
+"""
+        def run(answer):
+            master, slave = _pty.openpty()
+            process = controller.subprocess.Popen([sys.executable, "-c", child], stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+            os.close(slave)
+            out = b""
+            deadline = controller.time.monotonic() + 5
+            answered = False
+            while controller.time.monotonic() < deadline:
+                ready, _, _ = controller.select.select([master], [], [], 0.1)
+                if ready:
+                    try:
+                        chunk = os.read(master, 4096)
+                    except OSError:
+                        break
+                    out += chunk
+                    if b"prompt:" in out and not answered:
+                        answer(master)
+                        answered = True
+                if b"got=" in out or (process.poll() is not None and not ready):
+                    break
+            process.kill(); process.wait(); os.close(master)
+            return out
+        lost = run(lambda master: os.write(master, b"sms\n"))
+        self.assertNotIn(b"got=sms", lost, "the immediate write should have been flushed by TCSAFLUSH")
+        kept = run(lambda master: controller._answer_hidden_prompt(master, b"sms\n"))
+        self.assertIn(b"got=sms", kept)
+
+
 class ManifestFieldTests(unittest.TestCase):
     def host(self, **fields):
         temporary = tempfile.TemporaryDirectory()
