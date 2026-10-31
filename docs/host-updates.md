@@ -30,7 +30,16 @@ Each host entry has a `role`:
 defers while a runner job is live (below), but staging and validation still
 compete with the gate for the machine and the phone.
 
-**Staging defers while CI is busy.** First launch and component installs rewrite shared system frameworks under any running `xcodebuild` (on the Pro, 2026-10-31, this killed a running CD phone gate). `stage` returns `deferred-busy` while a runner job or build is live, downloads only on an idle host, and waits for idle again (up to two hours) right before the root helper's first launch; components on an already-installed host are likewise skipped while busy and repaired on a later run.
+**Promotion runs in the user's GUI session, never from a bare SSH shell.** The
+signed validation build needs the login keychain, which an SSH session cannot
+open: `codesign` fails with `errSecInternalComponent` ("User interaction is not
+allowed") on the Pro, 2026-10-31, while the same build passes from a LaunchAgent in
+`gui/<uid>` (how the Actions runner itself works). To push a reconcile over SSH,
+bootstrap a one-shot LaunchAgent into `gui/<uid>` with `launchctl bootstrap` and
+read its log; a `reconcile` run directly from an SSH shell will fail validation
+on every phone-gate host.
+
+**Staging defers while CI is busy.** First launch and component installs rewrite shared system frameworks under any running `xcodebuild` (on the Pro, 2026-10-31, this killed a running CD phone gate). `stage` returns `deferred-busy` while a runner job or build is live, downloads only on an idle host, and waits for idle again (up to two hours) right before the root helper's first launch; components on an already-installed host are likewise skipped while busy and repaired on a later run. `xcodebuild -downloadComponent` leaves helper `xcodebuild` processes alive for a moment after it returns, so promotion waits up to a 60-second settle window for the host to go idle before deferring; a real job holds `Runner.Worker` far longer than that.
 
 ## Manifest fields
 

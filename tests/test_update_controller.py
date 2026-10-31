@@ -186,14 +186,35 @@ class UpdateControllerTests(unittest.TestCase):
                 controller.reconcile("27.2", "27B52", [], "promote", Path("/tmp/state"))
 
     def test_busy_host_defers_before_the_validation_build(self):
+        clock = [0.0]
         with patch.object(controller, "report", return_value={"selected": "/Applications/Xcode.app/Contents/Developer", "selectedMatches": False}), \
              patch.object(controller, "stage"), patch.object(controller, "validate") as validate, \
              patch.object(controller, "activate") as activate, \
+             patch.object(controller.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(controller.time, "sleep", side_effect=lambda s: clock.__setitem__(0, clock[0] + s)) as sleep, \
              patch.object(controller, "run", return_value="/sbin/launchd\n/Users/chris/actions-runner/bin/Runner.Worker\n"):
             result = controller.reconcile("27.2", "27B52", [], "promote", Path("/tmp/state"))
         self.assertEqual(result, "deferred-busy")
+        # A live job is waited out only for the settle window, never for the full idle wait.
+        self.assertEqual(sleep.call_count, controller.SETTLE_SECONDS // controller.SETTLE_POLL_SECONDS)
         validate.assert_not_called()
         activate.assert_not_called()
+
+    def test_exiting_component_helpers_settle_before_the_validation_build(self):
+        # `xcodebuild -downloadComponent` leaves helper xcodebuild processes alive
+        # for a moment after it returns (the Pro, 2026-10-31): two ticks deferred
+        # for nothing. A host that is idle again within the settle window promotes.
+        helpers = "/sbin/launchd\n/Applications/Xcode_27.2.app/Contents/Developer/usr/bin/xcodebuild\n"
+        listings = iter([helpers, helpers, "/sbin/launchd\n"])
+        with patch.object(controller, "report", return_value={"selected": "/Applications/Xcode.app/Contents/Developer", "selectedMatches": False}), \
+             patch.object(controller, "stage"), patch.object(controller, "validate") as validate, \
+             patch.object(controller, "activate") as activate, \
+             patch.object(controller.time, "monotonic", return_value=0.0), patch.object(controller.time, "sleep"), \
+             patch.object(controller, "run", side_effect=lambda argv, **kwargs: next(listings)):
+            result = controller.reconcile("27.2", "27B52", [], "promote", Path("/tmp/state"))
+        self.assertEqual(result, "promoted")
+        validate.assert_called_once()
+        activate.assert_called_once()
 
     def test_stage_installs_through_the_helper_and_never_moves_itself(self):
         temporary = tempfile.TemporaryDirectory()
