@@ -71,7 +71,8 @@ check fails. A check that cannot determine its answer reports `ok: false` with
 3. `sudo` — the root helper is installed at `/usr/local/libexec/morpheus-factory-xcode`,
    owned by root, not group- or other-writable, byte-identical (sha256) to
    `worker/xcode-root-helper.sh`, and `sudo -n -l` allows it. The detail prints
-   the install commands (see [Root helper](#root-helper)). A changed checksum
+   the install commands (see [Root helper](#root-helper)). Every directory above
+   the helper must be root-owned and not group/other-writable too. A changed checksum
    means the helper was updated in the repository and must be reinstalled.
 4. `apple-credentials` — both configured variables are set and nonempty. Only the
    names are printed.
@@ -116,16 +117,22 @@ missing root helper or credential no longer surfaces after a multi-GB fetch. Run
 ## Root helper
 
 Only one command runs as root: `worker/xcode-root-helper.sh`, installed once by
-the operator as a root-owned copy and allowed by a single sudoers line:
+the operator as a root-owned copy and allowed by a single sudoers line.
+`/usr/local/libexec` does not exist on Apple-silicon Macs and BSD `install` does
+not create parents, so create it first:
 
 ```sh
+sudo install -d -o root -g wheel -m 755 /usr/local/libexec
 sudo install -o root -g wheel -m 755 worker/xcode-root-helper.sh /usr/local/libexec/morpheus-factory-xcode
 sudo visudo -f /etc/sudoers.d/morpheus-factory
 #   <user> ALL=(root) NOPASSWD: /usr/local/libexec/morpheus-factory-xcode
 ```
 
-Rerun the `install` line whenever the helper changes; `check` compares checksums
-and reports a stale copy.
+Rerun the file `install` line whenever the helper changes; `check` compares
+checksums and reports a stale copy. `check` also requires the helper and every
+directory above it to be root-owned and closed to group/other writes: a
+user-writable ancestor (Intel Homebrew owns parts of `/usr/local`) would let the
+worker user replace the root-owned file.
 
 Why a helper rather than sudoers rules for the individual commands: every such
 rule was root-equivalent. A bare `/bin/mv` allows any move as root. Sudoers
@@ -135,24 +142,38 @@ matches `*` against the whole concatenated argument string, so
 `/Applications/Xcode_<v>.app/.../xcodebuild` lets anyone who can write
 `/Applications` (every admin) plant a bundle at that path and run it as root.
 
-The helper takes exactly one verb and one app path (anything else exits 2) and
-refuses with exit 1 and a one-line reason before acting:
-
 | Verb | Accepts | Does |
 |---|---|---|
+| `install <src> <version>` | an expanded `…/Xcode.app` outside `/Applications` | quarantine, verify, first launch, install as `/Applications/Xcode_<version>.app` |
 | `select <app>` | `/Applications/Xcode.app` or `/Applications/Xcode_<version>.app` | `xcode-select --switch <app>/Contents/Developer` |
-| `first-launch <app>` | `/Applications/Xcode_<version>.app` | `xcodebuild -license accept`, then `-runFirstLaunch` |
 | `remove <app>` | `/Applications/Xcode_<version>.app` | `rm -rf -- <app>` |
 
-The path must be a real directory, not a symlink. `select` and `first-launch`
-require `spctl --assess --type execute` to pass, so only an Apple-signed bundle
-runs as root. `remove` refuses the app `xcode-select -p` points into and the
-target of an `/Applications/Xcode.app` symlink. The helper calls its tools by
-absolute path and never relies on `PATH`.
+Wrong argument counts exit 2; refusals exit 1 with a one-line reason before
+acting. Paths must be real directories, not symlinks, and the helper calls its
+tools by absolute path, never through `PATH`.
 
-Moving the expanded app into `/Applications` needs no root because the folder is
-admin-writable; the login user must be an administrator, and `stage` refuses
-with that message if the move fails.
+**`install` runs no code from a bundle the worker user can still write.**
+Checking a bundle in place and then executing it can be raced: the worker user
+(or any CI job on the host's runner) owns the expanded download and can write
+`/Applications`, so it could copy an installed Xcode to a new name, let the check
+pass, then replace `usr/bin/xcodebuild` or a package `-runFirstLaunch` installs
+between the check and the exec. So `install` first moves the bundle into
+`/var/root/morpheus-factory-xcode/Xcode_<version>.app` (root's home is
+`root:wheel 700` and on the same APFS volume, so this is a rename), then
+`chown -R root:wheel` and `chmod -R go-w`, and only then runs
+`codesign --verify --deep --strict` and `spctl --assess --type execute`, checks
+that `xcodebuild -version` reports `Xcode <version>`, runs `-license accept` and
+`-runFirstLaunch` from the quarantined copy, and finally moves it to
+`/Applications/Xcode_<version>.app`. It refuses if either destination exists. On
+any failure the bundle stays in quarantine and the helper prints its path;
+inspect it and recover with `sudo rm -rf /var/root/morpheus-factory-xcode/Xcode_<version>.app`.
+
+`select` requires `spctl --assess --type execute` to pass and runs only Apple's
+`xcode-select`; `remove` refuses the app `xcode-select -p` points into and the
+target of an `/Applications/Xcode.app` symlink. Neither executes bundle code as
+root. Because the worker user can call them, a CI job could still switch the
+selection to another signed Xcode or delete a non-selected one: an integrity and
+availability exposure, not a root one.
 
 ## Credentials
 
