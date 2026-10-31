@@ -161,23 +161,21 @@ class UpdateControllerTests(unittest.TestCase):
         validate.assert_not_called()
         activate.assert_not_called()
 
-    def test_stage_moves_without_sudo_and_first_launches_through_helper(self):
+    def test_stage_installs_through_the_helper_and_never_moves_itself(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
         applications = root / "Applications"
         applications.mkdir()
         commands = []
-        moved = []
 
         def command(argv, **kwargs):
             commands.append(argv)
             if argv[0] == "/usr/bin/xip":
                 (kwargs["cwd"] / "Xcode.app").mkdir()
-            if argv[0] == "/bin/mv":
-                if moved == ["fail"]:
-                    raise controller.UpdateError("mv exited 1")
-                Path(argv[1]).rename(argv[2])
+            if argv[:4] == ["/usr/bin/sudo", "-n", controller.HELPER_PATH, "install"]:
+                self.assertTrue(Path(argv[4]).is_dir())
+                (applications / "Xcode_27.2.app").mkdir()
             return ""
 
         def download(argv, verification, apple):
@@ -186,19 +184,42 @@ class UpdateControllerTests(unittest.TestCase):
         identity = lambda app: ("27.2", "27B52") if app.exists() else None
         with patch.object(controller, "APPLICATIONS", applications), patch.object(controller, "matching_app", return_value=None), \
              patch.object(controller, "installed_build", side_effect=identity), patch.object(controller, "run", side_effect=command), \
-             patch.object(controller, "run_xcodes", side_effect=download), patch.object(controller, "ensure_components"), \
+             patch.object(controller, "run_xcodes", side_effect=download), patch.object(controller, "ensure_components") as components, \
              patch.object(controller.shutil, "which", return_value="/opt/homebrew/bin/xcodes"), \
              patch.object(controller.shutil, "disk_usage", return_value=SimpleNamespace(free=80 * 1024**3)):
-            self.assertEqual(controller.stage("27.2", "27B52", root / "state"), "staged")
-            app = str(applications / "Xcode_27.2.app")
-            self.assertEqual([argv for argv in commands if "sudo" in argv[0]], [["/usr/bin/sudo", "-n", controller.HELPER_PATH, "first-launch", app]])
-            self.assertIn(["/bin/mv", str(next(iter(argv[1] for argv in commands if argv[0] == "/bin/mv"))), app], commands)
-            Path(app).rmdir()
-            moved.append("fail")
-            commands.clear()
-            with self.assertRaisesRegex(controller.UpdateError, "without sudo; the login user must be an administrator"):
+            self.assertEqual(controller.stage("27.2", "27B52", root / "state", components=["MetalToolchain"]), "staged")
+        helper = [argv for argv in commands if argv[0] == "/usr/bin/sudo"]
+        self.assertEqual(len(helper), 1)
+        self.assertEqual(helper[0][3:], ["install", helper[0][4], "27.2"])
+        self.assertEqual(Path(helper[0][4]).name, "Xcode.app")
+        self.assertTrue(Path(helper[0][4]).is_relative_to(root / "state"))
+        self.assertFalse(any(argv[0] == "/bin/mv" for argv in commands))
+        components.assert_called_once_with(applications / "Xcode_27.2.app", ["MetalToolchain"])
+        # The helper clones and leaves the source; the temporary directory removes it.
+        self.assertFalse(Path(helper[0][4]).exists())
+
+    def test_stage_refuses_when_helper_install_leaves_wrong_identity(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+
+        def command(argv, **kwargs):
+            if argv[0] == "/usr/bin/xip":
+                (kwargs["cwd"] / "Xcode.app").mkdir()
+            return ""
+
+        def identity(app):
+            return ("27.2", "27B52") if app.name == "Xcode.app" else None
+
+        with patch.object(controller, "APPLICATIONS", root), patch.object(controller, "matching_app", return_value=None), \
+             patch.object(controller, "installed_build", side_effect=identity), patch.object(controller, "run", side_effect=command), \
+             patch.object(controller, "run_xcodes", side_effect=lambda argv, *a: (Path(argv[-1]) / "x.xip").write_text("")), \
+             patch.object(controller, "ensure_components") as components, \
+             patch.object(controller.shutil, "which", return_value="/opt/homebrew/bin/xcodes"), \
+             patch.object(controller.shutil, "disk_usage", return_value=SimpleNamespace(free=80 * 1024**3)):
+            with self.assertRaisesRegex(controller.UpdateError, "did not retain the approved identity"):
                 controller.stage("27.2", "27B52", root / "state")
-            self.assertFalse(any("sudo" in argv[0] for argv in commands))
+        components.assert_not_called()
 
     def test_only_helper_invocations_use_sudo(self):
         lines = [line for line in SCRIPT.read_text().splitlines() if '"/usr/bin/sudo"' in line]
@@ -433,6 +454,7 @@ class FakeHost:
         self.helper = self.root / "morpheus-factory-xcode"
         self.helper.write_bytes(controller.HELPER_SOURCE.read_bytes())
         self.helper_stat = SimpleNamespace(st_uid=0, st_mode=0o100755)
+        self.ancestor_stats = {}
         self.identities = [(FINGERPRINT_A, "Apple Development: Chris (266U7M6NPQ)", "TAML3DQJTR"),
                            (FINGERPRINT_B, "Apple Development: chris@example.test (BB58HPM92M)", "D495224G8R")]
         self.device_state = "connected"
@@ -460,7 +482,9 @@ class FakeHost:
                     "Sim      5267E2AE-9663-4E13-A209-6FD35BB5F699 (UDID)   shutdown   iPhone 17 Pro")
         raise AssertionError(argv)
 
-    def status(self):
+    def status(self, path=None):
+        if path is not None:
+            return self.ancestor_stats.get(path, SimpleNamespace(st_uid=0, st_mode=0o040755))
         if self.helper_stat is None:
             raise FileNotFoundError(str(self.helper))
         return self.helper_stat
@@ -522,7 +546,7 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(self.failing(host), ["sudo"])
         detail = checks["sudo"]["detail"]
         self.assertIn(f"sudo -n does not allow {host.helper}", detail)
-        self.assertIn(f"sudo install -o root -g wheel -m 755 {controller.HELPER_SOURCE} {host.helper}", detail)
+        self.assertIn(f"sudo install -d -o root -g wheel -m 755 {host.helper.parent}; sudo install -o root -g wheel -m 755 {controller.HELPER_SOURCE} {host.helper}", detail)
         self.assertIn(f"sudo visudo -f /etc/sudoers.d/morpheus-factory: chris ALL=(root) NOPASSWD: {host.helper}", detail)
 
     def test_helper_must_be_root_owned_unwritable_and_current(self):
@@ -537,6 +561,16 @@ class CheckTests(unittest.TestCase):
         host.helper.write_bytes(controller.HELPER_SOURCE.read_bytes() + b"# changed\n")
         self.assertEqual(self.failing(host), ["sudo"])
         self.assertIn("differs from xcode-root-helper.sh; reinstall it", host.checks()["sudo"]["detail"])
+        host.helper.write_bytes(controller.HELPER_SOURCE.read_bytes())
+        self.assertEqual(self.failing(host), [])
+        parent = str(host.helper.parent)
+        for stat in (SimpleNamespace(st_uid=501, st_mode=0o040755), SimpleNamespace(st_uid=0, st_mode=0o040775)):
+            host.ancestor_stats = {parent: stat}
+            self.assertEqual(self.failing(host), ["sudo"])
+            self.assertIn(f"{parent} is not root-owned and closed to group/other writes", host.checks()["sudo"]["detail"])
+        host.ancestor_stats = {"/": SimpleNamespace(st_uid=0, st_mode=0o041777)}
+        self.assertIn("/ is not root-owned", host.checks()["sudo"]["detail"])
+        host.ancestor_stats = {}
         host.helper.unlink()
         host.helper_stat = None
         self.assertEqual(self.failing(host), ["sudo"])

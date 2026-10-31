@@ -248,11 +248,21 @@ recorded with its actual output.
   argument string, and `/Applications` is admin-writable, so a wildcard
   `xcodebuild` path would run a planted binary as root. The host keeps one
   root-owned helper (`worker/xcode-root-helper.sh`, installed once to
-  `/usr/local/libexec/morpheus-factory-xcode`) with three verbs that validate
-  the app path and require `spctl` to accept the bundle before `xcode-select`,
-  `-license accept`, `-runFirstLaunch` or removal run as root. The move into
-  `/Applications` needs no root at all. `check` reports a missing, stale or
-  writable helper.
+  `/usr/local/libexec/morpheus-factory-xcode`) with three verbs. A second review
+  showed that checking a bundle with `spctl` and then executing its `xcodebuild`
+  in place is still a race: the worker user owns the bundle and can write
+  `/Applications`, so it can swap the binary or a first-launch package between
+  check and exec. So `install` clones the expanded download (`cp -Rc`, APFS
+  copy-on-write) into a root-only quarantine (`/var/root/morpheus-factory-xcode`);
+  a clone rather than a move, because a write handle the user already holds on
+  a moved file still works, while a clone's bytes are out of its reach. It makes it root-owned and
+  unwritable, and only then verifies it (`codesign --deep --strict`, `spctl`,
+  the reported version), runs `-license accept` and `-runFirstLaunch`, and moves
+  it into `/Applications`; a failure leaves it in quarantine for manual
+  `sudo rm -rf`. `select` and `remove` run no bundle code as root; what they
+  leave a CI job is integrity and availability exposure (switching to another
+  signed Xcode, deleting a non-selected one), not root. `check` reports a
+  missing, stale or writable helper, or a writable directory above it.
 - *`xcodes` is installed from its pinned, checksummed release binary.* The
   Homebrew tap compiles it from source and fails on macOS 27 (observed on the
   Air; XcodesOrg/homebrew-made#4). One audited version and checksum in

@@ -505,21 +505,18 @@ def stage(version, build, stage_root, verification=None, components=(), apple=No
         actual = installed_build(expanded)
         if actual != (version, build):
             raise UpdateError(f"downloaded Xcode identity {actual} differs from approved pin")
-        run(["/usr/sbin/spctl", "--assess", "--type", "execute", str(expanded)])
-        # /Applications is admin-writable, so the move needs no root.
-        try:
-            run(["/bin/mv", str(expanded), str(app)])
-        except UpdateError as error:
-            raise UpdateError(f"could not move Xcode into {app.parent} without sudo; the login user must be an administrator") from error
+        # The helper moves the bundle into a root-only quarantine, verifies its
+        # signature there, runs first launch, and only then installs it, so
+        # nothing the worker user can still write ever runs as root.
+        root_helper("install", expanded, version, capture=False)
     if installed_build(app) != (version, build):
         raise UpdateError("installed Xcode did not retain the approved identity")
-    root_helper("first-launch", app, capture=False)
     ensure_components(app, components)
     return "staged"
 
 
-def root_helper(verb, app, capture=True):
-    return run(["/usr/bin/sudo", "-n", HELPER_PATH, verb, str(app)], capture=capture)
+def root_helper(verb, *arguments, capture=True):
+    return run(["/usr/bin/sudo", "-n", HELPER_PATH, verb, *map(str, arguments)], capture=capture)
 
 
 def host_is_busy():
@@ -650,12 +647,20 @@ def check_disk(pin):
 
 def helper_install_commands():
     user = os.environ.get("USER") or "<user>"
-    return (f"sudo install -o root -g wheel -m 755 {HELPER_SOURCE} {HELPER_PATH}; then add this line with "
+    return (f"sudo install -d -o root -g wheel -m 755 {Path(HELPER_PATH).parent}; "
+            f"sudo install -o root -g wheel -m 755 {HELPER_SOURCE} {HELPER_PATH}; then add this line with "
             f"sudo visudo -f {SUDOERS_FILE}: {user} ALL=(root) NOPASSWD: {HELPER_PATH}")
 
 
-def helper_status():
-    return os.stat(HELPER_PATH)
+def helper_status(path=None):
+    return os.stat(path or HELPER_PATH)
+
+
+def helper_ancestors():
+    # A writable ancestor (Intel Homebrew owns /usr/local) would let the worker
+    # user swap the root-owned helper out from under the sudoers rule.
+    path = Path(HELPER_PATH)
+    return [str(parent) for parent in path.parents]
 
 
 def check_sudo(pin):
@@ -671,6 +676,10 @@ def check_sudo(pin):
             problems.append(f"{HELPER_PATH} is group- or other-writable")
         if hashlib.sha256(Path(HELPER_PATH).read_bytes()).digest() != hashlib.sha256(HELPER_SOURCE.read_bytes()).digest():
             problems.append(f"{HELPER_PATH} differs from {HELPER_SOURCE.name}; reinstall it")
+        for ancestor in helper_ancestors():
+            parent = helper_status(ancestor)
+            if parent.st_uid != 0 or parent.st_mode & 0o022:
+                problems.append(f"{ancestor} is not root-owned and closed to group/other writes")
     try:
         run(["/usr/bin/sudo", "-n", "-l", HELPER_PATH])
     except UpdateError:
