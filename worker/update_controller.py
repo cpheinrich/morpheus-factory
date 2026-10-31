@@ -582,10 +582,17 @@ def stage(version, build, stage_root, verification=None, components=(), apple=No
         # signature there, runs first launch, and only then installs it, so
         # nothing the worker user can still write ever runs as root.
         root_helper("install", expanded, version, capture=False)
+    require_readable(app)
     if installed_build(app) != (version, build):
         raise UpdateError("installed Xcode did not retain the approved identity")
     ensure_components(app, components)
     return "staged"
+
+
+def require_readable(app):
+    """An installed bundle the login user cannot execute is a helper defect, not an identity mismatch."""
+    if not os.access(app / "Contents/Developer/usr/bin/xcodebuild", os.X_OK):
+        raise UpdateError(f"{app} is not readable by this user after install; the root helper must leave it world-readable")
 
 
 def root_helper(verb, *arguments, capture=True):

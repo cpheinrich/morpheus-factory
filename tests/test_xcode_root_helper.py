@@ -163,8 +163,8 @@ exit 0
         self.assertEqual(code, 0, stderr)
         quarantined = self.quarantine / "Xcode_27.2.app"
         binary = quarantined / "Contents/Developer/usr/bin/xcodebuild"
-        self.assertEqual(log[:6], [f"cp -Rc {source} {quarantined}", f"chown -R root:wheel {quarantined}", f"chmod -R go-w {quarantined}",
-                                   f"chmod -R -N {quarantined}",
+        self.assertEqual(log[:7], [f"cp -Rc {source} {quarantined}", f"chown -R root:wheel {quarantined}", f"chmod -R go-w {quarantined}",
+                                   f"chmod -R go+rX {quarantined}", f"chmod -R -N {quarantined}",
                                    f'codesign --verify --deep --strict -R=identifier "com.apple.dt.Xcode" and anchor apple {quarantined}',
                                    f"spctl --assess --type execute {quarantined}"])
         executed = [line for line in log if line.startswith("xcodebuild ")]

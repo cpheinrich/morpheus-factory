@@ -192,6 +192,7 @@ class UpdateControllerTests(unittest.TestCase):
 
         identity = lambda app: ("27.2", "27B52") if app.exists() else None
         with patch.object(controller, "APPLICATIONS", applications), patch.object(controller, "matching_app", return_value=None), \
+             patch.object(controller.os, "access", return_value=True), \
              patch.object(controller, "installed_build", side_effect=identity), patch.object(controller, "run", side_effect=command), \
              patch.object(controller, "run_xcodes", side_effect=download), patch.object(controller, "ensure_components") as components, \
              patch.object(controller.shutil, "which", return_value="/opt/homebrew/bin/xcodes"), \
@@ -207,6 +208,19 @@ class UpdateControllerTests(unittest.TestCase):
         # The helper clones and leaves the source; the temporary directory removes it.
         self.assertFalse(Path(helper[0][4]).exists())
 
+    def test_unreadable_install_is_named_not_blamed_on_identity(self):
+        # The Pro, 2026-10-31: the helper left /Applications/Xcode_27.2.app mode 700 root, so the
+        # user could not run its xcodebuild and the old message blamed the identity.
+        with tempfile.TemporaryDirectory() as temp:
+            app = Path(temp) / "Xcode_27.2.app"
+            binary = app / "Contents/Developer/usr/bin/xcodebuild"
+            with self.assertRaisesRegex(controller.UpdateError, "not readable by this user"):
+                controller.require_readable(app)
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/bin/sh\n")
+            binary.chmod(0o755)
+            controller.require_readable(app)
+
     def test_stage_refuses_when_helper_install_leaves_wrong_identity(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -221,6 +235,7 @@ class UpdateControllerTests(unittest.TestCase):
             return ("27.2", "27B52") if app.name == "Xcode.app" else None
 
         with patch.object(controller, "APPLICATIONS", root), patch.object(controller, "matching_app", return_value=None), \
+             patch.object(controller.os, "access", return_value=True), \
              patch.object(controller, "installed_build", side_effect=identity), patch.object(controller, "run", side_effect=command), \
              patch.object(controller, "run_xcodes", side_effect=lambda argv, *a: (Path(argv[-1]) / "x.xip").write_text("")), \
              patch.object(controller, "ensure_components") as components, \
