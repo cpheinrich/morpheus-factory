@@ -333,6 +333,9 @@ def advance_consumer(config: HostConfig, factory: Path, root: Path, state_path: 
     pin, consumer = config.pin, config.consumer
     if consumer_has_pin(root, pin, consumer):
         return None
+    # Only the image host drives the shared PR; others would duplicate agent runs.
+    if not config.has_ci:
+        return "waiting-consumer-merge"
     url, opened = ensure_consumer_pr(root, pin, consumer)
     if opened:
         return "waiting-consumer-pr"

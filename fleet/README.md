@@ -37,7 +37,8 @@ rewrites them in the tracked files matching `consumer.pinPaths`
 (`xcode-version`, `xcode-<v>` labels, `Xcode_<v>.app`, `Xcode <v>`,
 `Build version <b>`, bare `<b>`). An unreadable assertion or a substitution that
 changes nothing is an error, not agent work. An existing branch or open PR is
-reused, never rewritten.
+reused, never rewritten. Only `ci-image` hosts open or drive this PR; a `phone-gate`
+host with an unpinned consumer just returns `waiting-consumer-merge`.
 
 On a later tick, if that PR has still not merged, one **fresh** `codex exec`
 run (no resume, killed after 2 h) is asked to finish it under the consumer's

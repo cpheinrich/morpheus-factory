@@ -322,11 +322,17 @@ class ReconcileTests(unittest.TestCase):
         self.assertNotIn("agent", events)
         self.assertEqual(len(json.loads((self.root / "fleet.json").read_text())["agentRuns"]), 3)
 
-    def test_agent_that_merges_lets_host_promote(self):
+    def test_phone_gate_with_unpinned_consumer_drives_nothing(self):
         result, events = self.run_reconcile({"xcode": {"version": "27.2", "build": "27B52"}},
+                                            status={"installedMatches": True, "selectedMatches": False}, pinned=[False])
+        self.assertEqual((result, events), ("waiting-consumer-merge", []))
+        self.assertFalse((self.root / "fleet.json").exists())
+
+    def test_agent_that_merges_lets_host_promote(self):
+        result, events = self.run_reconcile({"xcode": {"version": "27.2", "build": "27B52"}, "ci": CI},
                                             status=[{"installedMatches": True, "selectedMatches": False}, {"installedMatches": True, "selectedMatches": True}],
                                             pinned=[False, True])
-        self.assertEqual((result, events), ("host-converged", ["pr", "agent", "reconcile"]))
+        self.assertEqual((result, events), ("host-converged", ["sync-tools", "image-stage", "pr", "agent", "reconcile"]))
 
     def test_reconcile_uses_host_credentials_project_not_consumer_checkout(self):
         manifest = write_manifest(self.root, {"xcode": {"version": "27.2", "build": "27B52"}})
