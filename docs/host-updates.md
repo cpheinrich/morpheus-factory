@@ -30,6 +30,8 @@ Each host entry has a `role`:
 defers while a runner job is live (below), but staging and validation still
 compete with the gate for the machine and the phone.
 
+**Staging defers while CI is busy.** First launch and component installs rewrite shared system frameworks under any running `xcodebuild` (on the Pro, 2026-10-31, this killed a running CD phone gate). `stage` returns `deferred-busy` while a runner job or build is live, downloads only on an idle host, and waits for idle again (up to two hours) right before the root helper's first launch; components on an already-installed host are likewise skipped while busy and repaired on a later run.
+
 ## Manifest fields
 
 All fields beyond `xcode` and `validation` are optional; `schemaVersion` stays 1.

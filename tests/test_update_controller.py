@@ -84,10 +84,35 @@ class UpdateControllerTests(unittest.TestCase):
         validate.assert_not_called()
         activate.assert_not_called()
 
+    def test_stage_defers_while_ci_is_busy(self):
+        # The Pro, 2026-10-31: first launch rewrote shared frameworks under a running CD phone gate.
+        with patch.object(controller, "matching_app", return_value=None), patch.object(controller, "host_is_busy", return_value=True), \
+             patch.object(controller, "run_xcodes") as download:
+            self.assertEqual(controller.stage("27.2", "27B52", Path("/tmp/state")), "deferred-busy")
+        download.assert_not_called()
+        app = Path("/Applications/Xcode_27.2.app")
+        with patch.object(controller, "matching_app", return_value=app), patch.object(controller, "host_is_busy", return_value=True), \
+             patch.object(controller, "run") as child:
+            self.assertEqual(controller.stage("27.2", "27B52", Path("/tmp/state"), components=["MetalToolchain"]), "deferred-busy")
+        child.assert_not_called()
+
+    def test_wait_until_idle_polls_then_gives_up(self):
+        clock = [0.0]
+        with patch.object(controller, "host_is_busy", side_effect=[True, True, False]), \
+             patch.object(controller.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(controller.time, "sleep", side_effect=lambda s: clock.__setitem__(0, clock[0] + s)) as sleep:
+            self.assertTrue(controller.wait_until_idle(timeout=600, poll=30))
+        self.assertEqual(sleep.call_count, 2)
+        clock[0] = 0.0
+        with patch.object(controller, "host_is_busy", return_value=True), \
+             patch.object(controller.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(controller.time, "sleep", side_effect=lambda s: clock.__setitem__(0, clock[0] + s)):
+            self.assertFalse(controller.wait_until_idle(timeout=90, poll=30))
+
     def test_already_installed_xcode_still_repairs_declared_components(self):
         app = Path("/Applications/Xcode_27.2.app")
         with patch.object(controller, "matching_app", return_value=app), \
-             patch.object(controller, "ensure_components") as ensure:
+             patch.object(controller, "ensure_components", return_value=True) as ensure:
             result = controller.stage("27.2", "27B52", Path("/tmp/state"), components=["MetalToolchain"])
         self.assertEqual(result, "already-installed")
         ensure.assert_called_once_with(app, ["MetalToolchain"])
