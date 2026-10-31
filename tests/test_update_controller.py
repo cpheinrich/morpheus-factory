@@ -557,7 +557,7 @@ class ManifestFieldTests(unittest.TestCase):
         self.assertEqual(pro.checks[0]["argv"][-2:], ["--device-gate", UDID])
         air = controller.pin_for_host(manifest, "christophers-macbook-air")
         self.assertEqual((air.apple, air.runner, air.verification, air.phase),
-                         ({"idVar": "APPLE_ID", "passwordVar": "APPLE_ID_PASSWORD"}, None, None, "stage"))
+                         ({"idVar": "ZOE_APPLE_ID", "passwordVar": "ZOE_APPLE_ID_PASSWORD"}, None, {"purpose": "apple-developer", "account": "zoe-apple-developer"}, "promote"))
         self.assertEqual(air.device_udid, "00008150-0015741E3AEA401C")
 
     def test_xcodes_names_the_configured_variables_when_missing(self):

@@ -95,19 +95,26 @@
     },
     "christophers-macbook-air": {
       "role": "phone-gate",
-      "hold": "Factory tick paused 2026-10-30: Xcode 27.2 (27B52) remains Evo's pin and the Mini's selected Xcode; the 27.2 UI-suite failures were traced to Evo source changes, not the toolchain. Resume (remove this hold) after `install_updates.py --check` passes on the host, which needs the root helper from #10 installed there.",
       "xcode": {
         "version": "27.2",
         "build": "27B52",
         "components": [
           "MetalToolchain"
         ],
-        "phase": "stage"
+        "phase": "promote"
       },
       "paths": {
         "factory": "/Users/chrisheinrich/code/morpheus-factory",
         "consumer": "/Users/chrisheinrich/code/evo",
         "credentialsProject": "/Users/chrisheinrich/code/evo"
+      },
+      "apple": {
+        "idVar": "ZOE_APPLE_ID",
+        "passwordVar": "ZOE_APPLE_ID_PASSWORD"
+      },
+      "verification": {
+        "purpose": "apple-developer",
+        "account": "zoe-apple-developer"
       },
       "signing": {
         "identity": "Apple Development",
