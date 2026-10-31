@@ -1022,6 +1022,11 @@ def check_validation(pin):
 
 
 PREFLIGHT = ("xcodes", "disk", "sudo", "apple-credentials", "verification-provider", "paths")
+# Checks whose failure stops Factory from acting on the host. The others
+# (runner plist, runner env, org runner groups, signing, device) describe what
+# the consumer's own jobs need; they are reported, and promotion validation
+# fails safely on them, but they do not block installing the hourly tick.
+BLOCKING = PREFLIGHT + ("ci", "runtimes", "validation")
 
 
 def host_checks(pin, only=None):
@@ -1051,7 +1056,7 @@ def host_checks(pin, only=None):
             ok, detail = False, f"could not be determined: {error}"
         except Exception as error:  # A check reports; it never aborts the others.
             ok, detail = False, f"could not be determined: {type(error).__name__}"
-        results.append({"name": name, "ok": bool(ok), "detail": detail})
+        results.append({"name": name, "ok": bool(ok), "blocking": name in BLOCKING, "detail": detail})
     return results
 
 
