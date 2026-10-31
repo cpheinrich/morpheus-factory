@@ -756,6 +756,22 @@ def version_key(version):
     return tuple(int(part) for part in version.split("."))
 
 
+def owned_by_caller(path):
+    return path.lstat().st_uid == os.getuid()
+
+
+def remove_app(app):
+    """Remove one Xcode bundle: Factory installs through the root helper, a
+    hand-installed /Applications/Xcode.app directly, since the caller owns it."""
+    if app.name != "Xcode.app":
+        root_helper("remove", app)
+        return
+    try:
+        shutil.rmtree(app)
+    except OSError as error:
+        raise UpdateError(f"could not remove {app}: {error.strerror}") from error
+
+
 def prune(version, build, retain, previous=None, window=False):
     """Keep `retain` Xcode bundles: protected ones first, then the newest others.
 
@@ -764,6 +780,9 @@ def prune(version, build, retain, previous=None, window=False):
     /Applications/Xcode.app symlink. During the migration window (`window`:
     promoted but not yet validated) at least two bundles stay, so the previous
     Xcode survives until delivery is green whatever `retain` says.
+    A hand-installed /Applications/Xcode.app (a real directory, not a symlink)
+    is a bundle like any other once Xcode identifies it: one Xcode per host
+    (Chris, 2026-10-31) applies to the app the host had before Factory too.
     Returns the removed paths, or None when the host is busy and nothing was
     considered, so a caller can tell "nothing to remove" from "not now".
     """
@@ -794,10 +813,24 @@ def prune(version, build, retain, previous=None, window=False):
         # Only a bundle Xcode itself identifies is ours to remove.
         if identity is not None:
             candidates.append((version_key(match.group(1)), app))
+    if plain.is_dir() and not plain.is_symlink() and plain.resolve() not in protected:
+        try:
+            identity = installed_build(plain)
+        except UpdateError:
+            identity = None
+        if identity is not None:
+            candidates.append((version_key(identity[0]), plain))
     candidates.sort(reverse=True)
+    surplus = [app for _, app in candidates[max(0, retain - len(protected)):]]
+    # The root helper removes only Factory's versioned bundles; a plain
+    # Xcode.app is removed as the caller, so it must be the caller's. Decide
+    # before touching anything so a refusal leaves the host as it was.
+    for app in surplus:
+        if app.name == "Xcode.app" and not owned_by_caller(app):
+            raise UpdateError(f"{app} is not owned by this user; remove it by hand (sudo rm -rf {app})")
     removed = []
-    for _, app in candidates[max(0, retain - len(protected)):]:
-        root_helper("remove", app)
+    for app in surplus:
+        remove_app(app)
         removed.append(str(app))
     return removed
 

@@ -325,10 +325,15 @@ whatever `retain` says: the selected app, the app selected before this reconcile
 and the recorded `previous` are protected, and with no known previous the newest
 other bundle stays. Pruning always keeps the selected app and the target of an
 `/Applications/Xcode.app` symlink, fills remaining slots with the newest other
-`/Applications/Xcode_<version>.app` bundles (compared numerically), and removes
-the rest with the helper's `remove`, listing them under `removed`. It only
-considers bundles whose `xcodebuild -version` it can read, never removes
-`/Applications/Xcode.app`, and does nothing on a busy host.
+bundles (Factory's `/Applications/Xcode_<version>.app`, compared numerically, and
+a hand-installed `/Applications/Xcode.app` ordered by the version it reports),
+and removes the rest, listing them under `removed`. Factory's bundles go through
+the helper's `remove`; a hand-installed `Xcode.app` is a real directory the user
+owns, so it is removed directly, and one owned by root makes `retire` refuse
+before removing anything (`sudo rm -rf` by hand). One Xcode per host (Chris,
+2026-10-31) covers the app the host had before Factory: on the MacBook Pro and
+Air the previous Xcode is exactly that plain bundle. Pruning only considers
+bundles whose `xcodebuild -version` it can read and does nothing on a busy host.
 
 **Validated** means three facts, judged by the [fleet coordinator](../fleet/README.md#retiring-the-previous-xcode):
 the host selects the pin, the consumer's merged main carries the pin, and the

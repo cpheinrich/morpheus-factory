@@ -1054,7 +1054,8 @@ class PruneTests(unittest.TestCase):
         def identity(app):
             if app.name in unreadable or not app.name.startswith("Xcode"):
                 return None
-            return ("x", "y")
+            # A hand-installed Xcode.app has no version in its name; Xcode's own answer sorts it.
+            return ("26.6", "17F113") if app.name == "Xcode.app" else ("x", "y")
 
         def command(argv, **kwargs):
             commands.append(argv)
@@ -1069,7 +1070,11 @@ class PruneTests(unittest.TestCase):
             removed = controller.prune("27.2", "27B52", retain, before, window=window)
         helper = [argv for argv in commands if argv[0] != "/bin/ps"]
         names = [Path(path).name for path in removed]
-        self.assertEqual(helper, [["/usr/bin/sudo", "-n", controller.HELPER_PATH, "remove", path] for path in removed])
+        # Factory's bundles go through the root helper; a hand-installed Xcode.app is removed directly.
+        self.assertEqual(helper, [["/usr/bin/sudo", "-n", controller.HELPER_PATH, "remove", path] for path in removed if Path(path).name != "Xcode.app"])
+        for path in removed:
+            if Path(path).name == "Xcode.app":
+                self.assertFalse(Path(path).exists())
         return names
 
     def test_retain_two_with_exactly_two_removes_nothing(self):
@@ -1081,9 +1086,38 @@ class PruneTests(unittest.TestCase):
     def test_versions_compare_numerically(self):
         self.assertEqual(self.prune(["27.2", "26.9", "26.10"], 2), ["Xcode_26.9.app"])
 
-    def test_retain_one_keeps_only_selected_and_never_plain_xcode(self):
+    def test_retain_one_removes_a_hand_installed_xcode_too_but_never_an_unidentified_bundle(self):
+        # One Xcode per host (Chris, 2026-10-31) covers the app the host had before Factory.
         self.assertEqual(sorted(self.prune(["27.2", "27.0", "26.3"], 1, extra=["Xcode.app", "Xcode_beta.app"])),
-                         ["Xcode_26.3.app", "Xcode_27.0.app"])
+                         ["Xcode.app", "Xcode_26.3.app", "Xcode_27.0.app"])
+        self.assertEqual(self.prune(["27.2"], 1, extra=["Xcode.app"], unreadable=["Xcode.app"]), [])
+
+    def test_hand_installed_xcode_sorts_by_its_own_version(self):
+        # 26.6 (what Xcode.app reports) is older than 27.0, so it goes first at retain 2.
+        self.assertEqual(self.prune(["27.2", "27.0"], 2, extra=["Xcode.app"]), ["Xcode.app"])
+
+    def test_hand_installed_xcode_survives_the_migration_window(self):
+        self.assertEqual(self.prune(["27.2"], 1, extra=["Xcode.app"], window=True), [])
+
+    def test_hand_installed_xcode_owned_by_root_refuses_before_removing_anything(self):
+        with patch.object(controller, "owned_by_caller", return_value=False):
+            with self.assertRaisesRegex(controller.UpdateError, "not owned by this user; remove it by hand"):
+                self.prune(["27.2", "27.0"], 1, extra=["Xcode.app"])
+
+    def test_selected_hand_installed_xcode_is_protected(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        applications = Path(temporary.name).resolve()
+        (applications / "Xcode.app").mkdir()
+        (applications / "Xcode_26.3.app").mkdir()
+        current = {"selectedMatches": True, "selected": str(applications / "Xcode.app/Contents/Developer")}
+        with patch.object(controller, "APPLICATIONS", applications), patch.object(controller, "installed_build", return_value=("27.2", "27B52")), \
+             patch.object(controller, "report", return_value=current), patch.object(controller, "host_is_busy", return_value=False), \
+             patch.object(controller, "root_helper") as helper:
+            removed = controller.prune("27.2", "27B52", 1)
+        self.assertEqual([Path(p).name for p in removed], ["Xcode_26.3.app"])
+        self.assertTrue((applications / "Xcode.app").exists())
+        helper.assert_called_once_with("remove", applications / "Xcode_26.3.app")
 
     def test_previously_selected_app_is_kept_over_a_newer_leftover(self):
         self.assertEqual(self.prune(["27.2", "27.0", "26.3"], 2, previous="26.3"), ["Xcode_27.0.app"])

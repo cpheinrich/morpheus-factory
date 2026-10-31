@@ -304,7 +304,11 @@ supersede acceptance item (5) and the "retained two" bundle count above.
   the same consumer evidence. The worker records the promotion
   (`promoted.json`); the fleet judges the evidence and calls the worker's
   `retire`, which never runs on a busy host and refuses when the previous app is
-  the selected one.
+  the selected one. Retirement also removes a hand-installed
+  `/Applications/Xcode.app` (Chris, 2026-10-31: "Let Factory do it"), the app a
+  host ran before Factory managed it; it is the user's own directory, removed as
+  the user, and a root-owned one is reported for removal by hand rather than
+  widening the root helper.
 - *Every host serves one CI image for every repository.* Chris: "I'm not doing
   much development of lakina or kairos on iOS right now. Don't worry about them.
   I don't want too many versions or exceptions lying around since that creates a
