@@ -147,7 +147,7 @@ class InstallUpdatesTests(unittest.TestCase):
             pin = SimpleNamespace(paths={"credentialsProject": str(project)})
             controller = SimpleNamespace(pin_for_host=lambda manifest, host: pin)
             with patch.object(installer, "load_controller", return_value=controller):
-                code, _, commands = self.run_installer(["--host", "christophers-macbook-air"], HEALTHY, home)
+                code, _, commands = self.run_installer(["--host", "christophers-macbook-pro"], HEALTHY, home)
             self.assertEqual(code, 0)
             self.assertEqual(commands[0][1]["cwd"], project)
             plist = plistlib.loads((home / "Library/LaunchAgents/com.morpheus-factory.host-updates.plist").read_bytes())
@@ -165,7 +165,7 @@ class InstallUpdatesTests(unittest.TestCase):
             pin = SimpleNamespace(paths={"credentialsProject": str(Path(directory) / "absent")})
             with patch.object(installer, "load_controller", return_value=SimpleNamespace(pin_for_host=lambda m, h: pin)), \
                  redirect_stderr(io.StringIO()):
-                code, _, commands = self.run_installer(["--check", "--host", "christophers-macbook-air"], HEALTHY, Path(directory))
+                code, _, commands = self.run_installer(["--check", "--host", "christophers-macbook-pro"], HEALTHY, Path(directory))
             self.assertEqual(code, 2)
             self.assertEqual(commands, [])
 

@@ -21,10 +21,10 @@ Each host entry has a `role`:
   validation is a signed device build: `validate_evo_main.py --device-gate <UDID>`
   runs Evo's `apps/ios/scripts/dev.sh build-device-gate <UDID>` in a detached
   worktree of freshly fetched `origin/main`. The MacBook Pro
-  (`christophers-macbook-pro`) is Evo's delivery phone gate; the MacBook Air is a
-  second phone-gate host. The shipped binary is built on 27.2 CI VMs, so both are
-  pinned to Xcode 27.2 (27B52) and held at `phase: "stage"` until each host is
-  prepared and `check` passes.
+  (`christophers-macbook-pro`) is Evo's delivery phone gate, pinned to Xcode 27.2
+  (27B52) like the CI VMs that build the shipped binary. The MacBook Air left the
+  pool on 2026-10-31 (Chris: "more trouble than its worth to test on it"); it is
+  a manual-build machine Factory does not manage.
 
 **Do not reconcile the Pro while an Evo delivery run is in progress.** Activation
 defers while a runner job is live (below), but staging and validation still

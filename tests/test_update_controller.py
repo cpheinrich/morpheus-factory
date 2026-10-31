@@ -601,10 +601,8 @@ class ManifestFieldTests(unittest.TestCase):
                                       "dir": "/Users/chrisheinrich/actions-runner-evo-cd-mbp-device",
                                       "requiredEnv": ["MORPHEUS_CREDENTIALS_REPO"], "organization": "darwin-health"})
         self.assertEqual(pro.checks[0]["argv"][-2:], ["--device-gate", UDID])
-        air = controller.pin_for_host(manifest, "christophers-macbook-air")
-        self.assertEqual((air.apple, air.runner, air.verification, air.phase),
-                         ({"idVar": "ZOE_APPLE_ID", "passwordVar": "ZOE_APPLE_ID_PASSWORD"}, None, {"purpose": "apple-developer", "account": "zoe-apple-developer"}, "promote"))
-        self.assertEqual(air.device_udid, "00008150-0015741E3AEA401C")
+        # The MacBook Air left the pool on 2026-10-31; it is not a Factory host.
+        self.assertNotIn("christophers-macbook-air", json.loads(manifest.read_text())["hosts"])
 
     def test_xcodes_names_the_configured_variables_when_missing(self):
         with patch.dict(os.environ, {}, clear=True):

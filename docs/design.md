@@ -271,6 +271,8 @@ recorded with its actual output.
   Air; XcodesOrg/homebrew-made#4). One audited version and checksum in
   `worker/setup/tools.sh`, the same shape as asccli in Morpheus.
 
+**The Air left the pool, 2026-10-31.** Chris dropped the MacBook Air as a test host after its end-to-end run stalled behind other sessions' builds; its manifest entry is removed and Factory no longer manages its Xcode. He keeps one Xcode there for manual builds: 27.2, moved to `/Applications/Xcode.app` by hand, with 27.0 deleted. The record below is history.
+
 **Air run, 2026-10-30.** `worker/setup.sh` completed (xcodes 2.1.0 installed;
 GarageBand and iMovie left in place because `sudo -n` is unavailable);
 `update_controller.py check --host christophers-macbook-air` and
