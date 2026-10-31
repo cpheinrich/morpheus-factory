@@ -20,15 +20,18 @@ a `ci-image` role without `ci` (or the reverse) is refused.
 
 1. Stage the approved app through the host's credentials companion.
 2. `ci-image` hosts only: sync host tools and run `image-stage`.
-3. Require **merged consumer main** to carry the pin: every `xcode-version:` and
+3. If `phase` is `"stage"`, hold (`held-at-stage`) before touching the consumer:
+   a held pin opens no consumer PR and spends no agent runs. `"promote"` or
+   absent goes on.
+4. Require **merged consumer main** to carry the pin: every `xcode-version:` and
    every `xcode-<X>` runner label in `.github/workflows/*.yml` equals the pin,
-   at least one workflow sets `xcode-version:`, and the assertion script names
-   `Xcode <version>` and `Build version <build>`. No workflow names are listed;
+   at least one workflow sets `xcode-version:`, and every `Xcode <x>`,
+   `Xcode\ <x>` and `Build version <b>` token in the assertion script equals
+   the pin (at least one of each; 27.21 is not 27.2). No workflow names are listed;
    `consumer.ignorePaths` names lanes the consumer keeps on an older Xcode on
    purpose (Evo's `cd-v2-*.yml` until its deletion), which are neither judged
    nor rewritten. A host that already selects the pin reports `host-converged`
    without touching the consumer: the gate protects the switch, not the past.
-4. If `phase` is `"stage"`, hold (`held-at-stage`). `"promote"` or absent goes on.
 5. Run the host reconciler (validate with `DEVELOPER_DIR`, switch `xcode-select`,
    roll back a failed switch) and report `host-converged` once it is selected.
 
@@ -38,14 +41,17 @@ When consumer main is not pinned, the controller opens a deterministic **draft**
 PR on branch `factory/xcode-<version>-<build>`: in a temporary detached worktree
 of `origin/main` it reads the old version/build from the assertion script and
 rewrites them in the tracked files matching `consumer.pinPaths`
-(`xcode-version`, `xcode-<v>` labels, `Xcode_<v>.app`, `Xcode <v>`,
-`Build version <b>`, bare `<b>`). An unreadable assertion or a substitution that
-changes nothing is an error, not agent work. An existing branch or open PR is
-reused, never rewritten. Only `ci-image` hosts open or drive this PR; a `phone-gate`
+(`xcode-version`, `xcode-<v>` labels, `Xcode_<v>.app`, `Xcode <v>`, `Xcode\ <v>`,
+`Build version <b>`, bare `<b>`). An unreadable assertion, a substitution that
+changes nothing, or a rewritten file that still contains the old version or
+build in any form is an error, not agent work. An existing branch or open PR is
+reused, never rewritten. A closed, unmerged PR for the branch is an operator's
+rejection: the result is `waiting-human: consumer pin PR <url> was closed; delete
+branch <branch> to retry`, and no new PR is opened. Only `ci-image` hosts open or drive this PR; a `phone-gate`
 host with an unpinned consumer just returns `waiting-consumer-merge`.
 
 On a later tick, if that PR has still not merged, one **fresh** `codex exec`
-run (no resume, killed after 2 h) is asked to finish it under the consumer's
+run (no resume; its whole process group is killed after 2 h) is asked to finish it under the consumer's
 normal review and CI rules. At most **3 runs per pin**; after that the result is
 `waiting-human: consumer pin PR <url> needs attention`. No agent pushes protected
 main or opens a second PR.

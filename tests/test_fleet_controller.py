@@ -17,6 +17,30 @@ ASSERTION = "apps/ios/scripts/ci/assert-xcode-build.sh"
 CI = {"repository": "darwin-health/evo", "image": "ci-xcode-27.2", "label": "xcode-27.2"}
 
 
+# Evo's apps/ios/scripts/ci/assert-xcode-build.sh, copied verbatim.
+REAL_ASSERTION = r'''#!/bin/bash
+# A version match alone can admit a release candidate with a different build.
+set -euo pipefail
+mode="${1:-}"
+[[ -z "$mode" || "$mode" == --require-final ]] || { echo "unknown assertion mode" >&2; exit 2; }
+developer="${DEVELOPER_DIR:-}"
+if [[ -z "$developer" ]]; then
+  if [[ -d /Applications/Xcode_27.2.app ]]; then
+    developer=/Applications/Xcode_27.2.app/Contents/Developer
+  else
+    developer=/Applications/Xcode.app/Contents/Developer
+  fi
+fi
+identity="$("$developer/usr/bin/xcodebuild" -version)"
+if [[ "$mode" == --require-final || "$identity" == Xcode\ 27.2$'\n'* ]]; then
+  [[ "$identity" == $'Xcode 27.2\nBuild version 27B52' ]] || {
+    echo "Expected final Xcode 27.2 build 27B52, got a different toolchain" >&2
+    exit 1
+  }
+fi
+'''
+
+
 def write_manifest(root: Path, entry: dict, **top) -> Path:
     manifest = root / "updates.json"
     manifest.write_text(json.dumps({"schemaVersion": 1, **top, "hosts": {"zoe-mac-mini": entry}}))
@@ -175,6 +199,37 @@ class ConsumerPinTests(unittest.TestCase):
         rewritten = controller.substitute_pin(files[ASSERTION], ("27.2", "27B52"), controller.Pin("27.3", "27C5", "promote"))
         self.assertEqual(rewritten, "[[ \"$identity\" == $'Xcode 27.3\\nBuild version 27C5' ]] || exit 1\n")
 
+    def test_real_assertion_script_passes_only_when_every_token_matches(self):
+        files = pinned_files()
+        files[ASSERTION] = REAL_ASSERTION
+        self.assertIs(self.check(files)[0], True)
+        # One stale line beside updated ones is not pinned.
+        files[ASSERTION] = REAL_ASSERTION.replace("Xcode\\ 27.2", "Xcode\\ 26.6")
+        self.assertNotEqual(files[ASSERTION], REAL_ASSERTION)
+        self.assertIs(self.check(files)[0], False)
+        # A substring of the pin is not the pin.
+        files[ASSERTION] = REAL_ASSERTION.replace("27.2", "27.21")
+        self.assertIs(self.check(files)[0], False)
+        self.assertIs(self.check({**pinned_files(), ASSERTION: "echo Xcode 27.2\n"})[0], False)
+
+    def test_real_assertion_script_is_fully_rewritten(self):
+        new = controller.Pin("27.3", "27C5", "promote")
+        old = controller.assertion_pin(REAL_ASSERTION)
+        self.assertEqual(old, ("27.2", "27B52"))
+        rewritten = controller.substitute_pin(REAL_ASSERTION, old, new)
+        self.assertIn('"$identity" == Xcode\\ 27.3$\'\\n\'*', rewritten)
+        self.assertIn("$'Xcode 27.3\\nBuild version 27C5'", rewritten)
+        self.assertIn("/Applications/Xcode_27.3.app", rewritten)
+        self.assertIn("Expected final Xcode 27.3 build 27C5", rewritten)
+        self.assertNotIn("27.2", rewritten)
+        self.assertNotIn("27B52", rewritten)
+        self.assertFalse(controller.residual_pin(rewritten, old, new))
+        repo = FakeRepo({**pinned_files(), ASSERTION: rewritten})
+        command, git_file = repo.patches()
+        with command, git_file:
+            self.assertIs(controller.consumer_has_pin(Path("/evo"), new, CONSUMER), False)  # workflows still say 27.2
+            self.assertIs(controller.consumer_has_pin(Path("/evo"), PIN, CONSUMER), False)  # assertion says 27.3
+
     def test_no_workflow_mentions_xcode_version_fails(self):
         files = pinned_files()
         files[".github/workflows/ios-delivery.yml"] = "jobs:\n  test:\n    runs-on: xcode-27.2\n"
@@ -201,6 +256,25 @@ class SubstitutionTests(unittest.TestCase):
         self.assertEqual(controller.assertion_pin('expected="Xcode 26.6"\nbuild="Build version 26F12"\n'), ("26.6", "26F12"))
         with self.assertRaisesRegex(controller.FleetError, "cannot read"):
             controller.assertion_pin("echo checking xcode\n")
+
+    def test_refuses_when_old_pin_survives_rewrite(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "a.yml").write_text("xcode-version: '26.6'\nDEVELOPER_DIR: /Applications/Xcode-26.6.app\n")
+            with self.assertRaisesRegex(controller.FleetError, "left the old Xcode pin in a.yml"):
+                controller.rewrite_pin_files(root, {"a.yml"}, ("*.yml",), ("26.6", "26F12"), PIN)
+            (root / "a.yml").write_text("xcode-version: '26.6'\nid: build-26F12\n")
+            self.assertEqual(controller.rewrite_pin_files(root, {"a.yml"}, ("*.yml",), ("26.6", "26F12"), PIN), ["a.yml"])
+            (root / "a.yml").write_text("xcode-version: '26.6'\nid: build_26F12\n")
+            with self.assertRaisesRegex(controller.FleetError, "left the old Xcode pin"):
+                controller.rewrite_pin_files(root, {"a.yml"}, ("*.yml",), ("26.6", "26F12"), PIN)
+
+    def test_build_only_bump_keeps_version(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "assert.sh").write_text("Xcode 27.2\nBuild version 27B48\n")
+            self.assertEqual(controller.rewrite_pin_files(root, {"assert.sh"}, ("*.sh",), ("27.2", "27B48"), PIN), ["assert.sh"])
+            self.assertEqual((root / "assert.sh").read_text(), "Xcode 27.2\nBuild version 27B52\n")
 
     def test_refuses_when_nothing_changes(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -237,7 +311,7 @@ class ConsumerPrTests(unittest.TestCase):
         command, git_file = repo.patches()
         with command, git_file:
             url, opened = controller.ensure_consumer_pr(Path("/evo"), PIN, CONSUMER)
-        self.assertEqual((url, opened), ("https://github.com/darwin-health/evo/pull/700", True))
+        self.assertEqual((url, opened), ("https://github.com/darwin-health/evo/pull/700", "opened"))
         self.assertEqual(sorted(repo.added), [".github/workflows/ios-ci.yml", ".github/workflows/ios-delivery.yml", ASSERTION])
         self.assertEqual(repo.added[ASSERTION], 'expected="Xcode 27.2"\nbuild="Build version 27B52"\n')
         worktree = next(call for call in repo.calls if "worktree" in call and "add" in call)
@@ -259,17 +333,33 @@ class ConsumerPrTests(unittest.TestCase):
         self.assertFalse(Path(remove[-1]).exists())
 
     def test_existing_pr_is_reused(self):
-        repo = FakeRepo(old_files(), prs=[{"number": 7, "url": "https://github.com/darwin-health/evo/pull/7", "isDraft": True, "mergeStateStatus": "BLOCKED"}])
+        repo = FakeRepo(old_files(), prs=[{"number": 7, "url": "https://github.com/darwin-health/evo/pull/7", "state": "OPEN", "isDraft": True, "mergedAt": None}])
         command, git_file = repo.patches()
         with command, git_file:
-            self.assertEqual(controller.ensure_consumer_pr(Path("/evo"), PIN, CONSUMER), ("https://github.com/darwin-health/evo/pull/7", False))
+            self.assertEqual(controller.ensure_consumer_pr(Path("/evo"), PIN, CONSUMER), ("https://github.com/darwin-health/evo/pull/7", "open"))
+        self.assertEqual(repo.calls, [["gh", "pr", "list", "--repo", "darwin-health/evo", "--head", "factory/xcode-27.2-27B52",
+                                       "--state", "all", "--json", "number,url,state,isDraft,mergedAt"]])
+
+    def test_closed_pr_is_never_recreated(self):
+        closed = {"number": 7, "url": "https://github.com/darwin-health/evo/pull/7", "state": "CLOSED", "isDraft": True, "mergedAt": None}
+        repo = FakeRepo(old_files(), prs=[closed], remote_branch="abc123\trefs/heads/factory/xcode-27.2-27B52")
+        command, git_file = repo.patches()
+        with command, git_file:
+            self.assertEqual(controller.ensure_consumer_pr(Path("/evo"), PIN, CONSUMER), ("https://github.com/darwin-health/evo/pull/7", "closed"))
         self.assertEqual(len(repo.calls), 1)
+
+    def test_merged_pr_falls_through_to_normal_path(self):
+        merged = {"number": 6, "url": "https://github.com/darwin-health/evo/pull/6", "state": "MERGED", "isDraft": False, "mergedAt": "2026-10-29T00:00:00Z"}
+        repo = FakeRepo(old_files(), prs=[merged])
+        command, git_file = repo.patches()
+        with command, git_file:
+            self.assertEqual(controller.ensure_consumer_pr(Path("/evo"), PIN, CONSUMER), ("https://github.com/darwin-health/evo/pull/700", "opened"))
 
     def test_existing_branch_is_not_rewritten(self):
         repo = FakeRepo(old_files(), remote_branch="abc123\trefs/heads/factory/xcode-27.2-27B52")
         command, git_file = repo.patches()
         with command, git_file:
-            self.assertEqual(controller.ensure_consumer_pr(Path("/evo"), PIN, CONSUMER)[1], True)
+            self.assertEqual(controller.ensure_consumer_pr(Path("/evo"), PIN, CONSUMER)[1], "opened")
         self.assertFalse(any("push" in call or "worktree" in call for call in repo.calls))
         self.assertEqual(repo.calls[-1][:3], ["gh", "pr", "create"])
 
@@ -291,7 +381,7 @@ class ReconcileTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_reconcile(self, entry, *, status, pinned, pr=("https://github.com/darwin-health/evo/pull/7", False)):
+    def run_reconcile(self, entry, *, status, pinned, pr=("https://github.com/darwin-health/evo/pull/7", "open")):
         manifest = write_manifest(self.root, entry)
         events = []
         with patch.object(controller, "host_status", side_effect=status if isinstance(status, list) else None, return_value=status), \
@@ -326,15 +416,25 @@ class ReconcileTests(unittest.TestCase):
                                             status={"installedMatches": True, "selectedMatches": True}, pinned=[False])
         self.assertEqual((result, events), ("host-converged", ["sync-tools", "image-stage"]))
 
-    def test_stage_phase_holds_after_consumer_pin(self):
+    def test_stage_phase_holds_before_consumer_step(self):
+        # pinned=[] means any consumer check raises StopIteration: the hold must not reach it.
         result, events = self.run_reconcile({"xcode": {"version": "27.2", "build": "27B52", "phase": "stage"}, "ci": CI},
-                                            status={"installedMatches": True, "selectedMatches": False}, pinned=[True])
+                                            status={"installedMatches": True, "selectedMatches": False}, pinned=[])
         self.assertEqual((result, events), ("held-at-stage", ["sync-tools", "image-stage"]))
+        self.assertFalse((self.root / "fleet.json").exists())
+
+    def test_closed_pr_waits_for_human_without_agent(self):
+        result, events = self.run_reconcile({"xcode": {"version": "27.2", "build": "27B52"}, "ci": CI},
+                                            status={"installedMatches": True, "selectedMatches": False}, pinned=[False],
+                                            pr=("https://github.com/darwin-health/evo/pull/7", "closed"))
+        self.assertEqual(result, "waiting-human: consumer pin PR https://github.com/darwin-health/evo/pull/7 was closed; "
+                                 "delete branch factory/xcode-27.2-27B52 to retry")
+        self.assertEqual(events, ["sync-tools", "image-stage", "pr"])
 
     def test_opened_pr_waits_without_agent(self):
         result, events = self.run_reconcile({"xcode": {"version": "27.2", "build": "27B52"}, "ci": CI},
                                             status={"installedMatches": True, "selectedMatches": False}, pinned=[False],
-                                            pr=("https://github.com/darwin-health/evo/pull/7", True))
+                                            pr=("https://github.com/darwin-health/evo/pull/7", "opened"))
         self.assertEqual((result, events), ("waiting-consumer-pr", ["sync-tools", "image-stage", "pr"]))
 
     def test_existing_pr_runs_one_agent_then_waits_for_merge(self):
@@ -444,6 +544,23 @@ class HostAndStateTests(unittest.TestCase):
             with patch.object(controller.subprocess, "Popen", side_effect=lambda argv, **kw: real_popen([str(shim)], **kw)):
                 with self.assertRaisesRegex(controller.FleetError, "did not complete"):
                     controller.run_agent(PIN, "https://x/pull/1", CONSUMER, Path("/factory"), Path("/evo"))
+
+    def test_watchdog_kills_grandchild_holding_stdout(self):
+        import time
+        with tempfile.TemporaryDirectory() as temp:
+            shim = Path(temp) / "codex"
+            # codex exits at once; its child keeps stdout open for 30 s.
+            shim.write_text("#!/bin/sh\ncat >/dev/null\nsleep 30 &\nexit 0\n")
+            shim.chmod(0o755)
+            real_popen = controller.subprocess.Popen
+            with patch.object(controller, "AGENT_TIMEOUT_SECONDS", 1), \
+                 patch.object(controller.subprocess, "Popen", side_effect=lambda argv, **kw: real_popen([str(shim)], **kw)) as popen:
+                started = time.monotonic()
+                with self.assertRaisesRegex(controller.FleetError, "did not complete"):
+                    controller.run_agent(PIN, "https://x/pull/1", CONSUMER, Path("/factory"), Path("/evo"))
+                elapsed = time.monotonic() - started
+            self.assertIs(popen.call_args.kwargs["start_new_session"], True)
+            self.assertLess(elapsed, 10)
 
     def test_github_wrapper_scopes_credential_environment(self):
         class Result:
