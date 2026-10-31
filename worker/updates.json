@@ -92,42 +92,6 @@
           "argv": ["/usr/bin/python3", "/Users/chrisheinrich/code/morpheus-factory/worker/validate_evo_main.py", "--repo", "/Users/chrisheinrich/code/evo", "--device-gate", "00008120-00122CC80233401E"]
         }
       ]
-    },
-    "christophers-macbook-air": {
-      "role": "phone-gate",
-      "xcode": {
-        "version": "27.2",
-        "build": "27B52",
-        "components": [
-          "MetalToolchain"
-        ],
-        "phase": "promote"
-      },
-      "paths": {
-        "factory": "/Users/chrisheinrich/code/morpheus-factory",
-        "consumer": "/Users/chrisheinrich/code/evo",
-        "credentialsProject": "/Users/chrisheinrich/code/evo"
-      },
-      "apple": {
-        "idVar": "ZOE_APPLE_ID",
-        "passwordVar": "ZOE_APPLE_ID_PASSWORD"
-      },
-      "verification": {
-        "purpose": "apple-developer",
-        "account": "zoe-apple-developer"
-      },
-      "signing": {
-        "identity": "Apple Development",
-        "team": "TAML3DQJTR"
-      },
-      "device": {
-        "udid": "00008150-0015741E3AEA401C"
-      },
-      "validation": [
-        {
-          "argv": ["/usr/bin/python3", "/Users/chrisheinrich/code/morpheus-factory/worker/validate_evo_main.py", "--repo", "/Users/chrisheinrich/code/evo", "--device-gate", "00008150-0015741E3AEA401C"]
-        }
-      ]
     }
   }
 }
