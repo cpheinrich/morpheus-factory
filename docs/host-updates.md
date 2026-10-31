@@ -164,10 +164,14 @@ takes seconds). It clones rather than moves because a write handle a user proces
 already holds on the original would follow a moved file, but cannot reach a
 copy-on-write clone's bytes; the source is never deleted as root, and the
 controller's temporary directory removes it. Then
-`chown -R root:wheel` and `chmod -R go-w`, and only then runs
-`codesign --verify --deep --strict` and `spctl --assess --type execute`, checks
-that `xcodebuild -version` reports `Xcode <version>`, runs `-license accept` and
-`-runFirstLaunch` from the quarantined copy, and finally moves it to
+`chown -R root:wheel`, `chmod -R go-w` and `chmod -R -N` (no ACLs), and only
+then runs `codesign --verify --deep --strict` against Xcode's own designated
+requirement (`identifier "com.apple.dt.Xcode" and anchor apple`: a valid
+signature alone would admit any notarized Developer ID bundle named Xcode) and
+`spctl --assess --type execute`, checks that `xcodebuild -version` reports
+`Xcode <version>`, runs `-license accept` and `-runFirstLaunch` from the
+quarantined copy with a clean environment (`env -i HOME=/var/root`), and
+finally moves it (`mv -h`, refusing if the target was replaced meanwhile) to
 `/Applications/Xcode_<version>.app`. It refuses if either destination exists. On
 any failure the bundle stays in quarantine and the helper prints its path;
 inspect it and recover with `sudo rm -rf /var/root/morpheus-factory-xcode/Xcode_<version>.app`.

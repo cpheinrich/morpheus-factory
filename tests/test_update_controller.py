@@ -563,7 +563,8 @@ class CheckTests(unittest.TestCase):
         self.assertIn("differs from xcode-root-helper.sh; reinstall it", host.checks()["sudo"]["detail"])
         host.helper.write_bytes(controller.HELPER_SOURCE.read_bytes())
         self.assertEqual(self.failing(host), [])
-        parent = str(host.helper.parent)
+        # Ancestors are checked on the resolved path (a temp dir under /var resolves to /private/var).
+        parent = str(host.helper.parent.resolve())
         for stat in (SimpleNamespace(st_uid=501, st_mode=0o040755), SimpleNamespace(st_uid=0, st_mode=0o040775)):
             host.ancestor_stats = {parent: stat}
             self.assertEqual(self.failing(host), ["sudo"])

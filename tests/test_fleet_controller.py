@@ -346,7 +346,7 @@ class ConsumerPrTests(unittest.TestCase):
         command, git_file = repo.patches()
         with command, git_file:
             self.assertEqual(controller.ensure_consumer_pr(Path("/evo"), PIN, CONSUMER), ("https://github.com/darwin-health/evo/pull/7", "closed"))
-        self.assertEqual(len(repo.calls), 1)
+        self.assertFalse(any(call[:3] == ["gh", "pr", "create"] or "push" in call or "worktree" in call for call in repo.calls))
 
     def test_merged_pr_falls_through_to_normal_path(self):
         merged = {"number": 6, "url": "https://github.com/darwin-health/evo/pull/6", "state": "MERGED", "isDraft": False, "mergedAt": "2026-10-29T00:00:00Z"}
@@ -367,10 +367,19 @@ class ConsumerPrTests(unittest.TestCase):
     def test_newest_closed_pr_wins_over_older_merged(self):
         merged = {"number": 5, "url": "https://github.com/darwin-health/evo/pull/5", "state": "MERGED", "isDraft": False, "mergedAt": "2026-10-28T00:00:00Z"}
         closed = {"number": 6, "url": "https://github.com/darwin-health/evo/pull/6", "state": "CLOSED", "isDraft": True, "mergedAt": None}
-        repo = FakeRepo(old_files(), prs=[merged, closed])
+        repo = FakeRepo(old_files(), prs=[merged, closed], remote_branch="abc123\trefs/heads/factory/xcode-27.2-27B52")
         command, git_file = repo.patches()
         with command, git_file:
             self.assertEqual(controller.ensure_consumer_pr(Path("/evo"), PIN, CONSUMER), ("https://github.com/darwin-health/evo/pull/6", "closed"))
+
+    def test_closed_pr_with_deleted_branch_is_retried(self):
+        # "Delete the branch to retry" must actually work: gh still lists the closed PR afterwards.
+        closed = {"number": 7, "url": "https://github.com/darwin-health/evo/pull/7", "state": "CLOSED", "isDraft": True, "mergedAt": None}
+        repo = FakeRepo(old_files(), prs=[closed])
+        command, git_file = repo.patches()
+        with command, git_file:
+            self.assertEqual(controller.ensure_consumer_pr(Path("/evo"), PIN, CONSUMER), ("https://github.com/darwin-health/evo/pull/700", "opened"))
+        self.assertTrue(any(call[:3] == ["gh", "pr", "create"] for call in repo.calls))
 
     def test_existing_branch_is_not_rewritten(self):
         repo = FakeRepo(old_files(), remote_branch="abc123\trefs/heads/factory/xcode-27.2-27B52")

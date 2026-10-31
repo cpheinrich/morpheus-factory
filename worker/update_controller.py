@@ -659,7 +659,9 @@ def helper_status(path=None):
 def helper_ancestors():
     # A writable ancestor (Intel Homebrew owns /usr/local) would let the worker
     # user swap the root-owned helper out from under the sudoers rule.
-    path = Path(HELPER_PATH)
+    # Resolve first: a root-owned symlink into a tree with a writable parent
+    # would pass a check on the path as written.
+    path = Path(HELPER_PATH).resolve()
     return [str(parent) for parent in path.parents]
 
 
@@ -670,6 +672,8 @@ def check_sudo(pin):
     except FileNotFoundError:
         problems.append(f"{HELPER_PATH} is not installed")
     else:
+        if Path(HELPER_PATH).is_symlink():
+            problems.append(f"{HELPER_PATH} is a symlink")
         if status.st_uid != 0:
             problems.append(f"{HELPER_PATH} is not owned by root")
         if status.st_mode & 0o022:

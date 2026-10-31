@@ -273,11 +273,11 @@ def ensure_consumer_pr(root: Path, pin: Pin, consumer: Consumer) -> tuple[str, s
         if pr.get("state") == "OPEN":
             return pr["url"], "open"
     newest = max(listed, key=lambda pr: pr.get("number", 0), default=None)
-    if newest and not newest.get("mergedAt"):
-        return newest["url"], "closed"
     branch_exists = bool(command(["git", "-C", str(root), "ls-remote", "--heads", "origin", branch]))
+    # Deleting the branch is the operator's "retry": with it gone, a rejected or
+    # reverted PR no longer holds the pin back and a fresh one may be opened.
     if newest and branch_exists:
-        return newest["url"], "merged"
+        return newest["url"], "merged" if newest.get("mergedAt") else "closed"
     if branch_exists:
         files = "See the branch diff; the branch already existed when this PR was opened."
     else:

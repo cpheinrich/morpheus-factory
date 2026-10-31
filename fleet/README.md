@@ -46,11 +46,13 @@ rewrites them in the tracked files matching `consumer.pinPaths`
 changes nothing, or a rewritten file that still contains the old version or
 build in any form is an error, not agent work. An existing branch or open PR is
 reused, never rewritten. A closed, unmerged PR for the branch is an operator's
-rejection: the result is `waiting-human: consumer pin PR <url> was closed; delete
-branch <branch> to retry`, and no new PR is opened. If the newest PR merged but main no longer
-carries the pin and its branch still exists (a revert), the result is
-`waiting-human: … merged but main no longer carries the pin; delete branch
-<branch> to retry`. Only `ci-image` hosts open or drive this PR; a `phone-gate`
+rejection while its branch exists: the result is `waiting-human: consumer pin
+PR <url> was closed; delete branch <branch> to retry`, and no new PR is opened.
+If the newest PR merged but main no longer carries the pin and its branch still
+exists (a revert), the result is `waiting-human: … merged but main no longer
+carries the pin; delete branch <branch> to retry`. Deleting the branch is the
+retry in both cases: GitHub keeps listing the old PR, so the branch, not the PR
+list, decides. Only `ci-image` hosts open or drive this PR; a `phone-gate`
 host with an unpinned consumer just returns `waiting-consumer-merge`.
 
 On a later tick, if that PR has still not merged, one **fresh** `codex exec`

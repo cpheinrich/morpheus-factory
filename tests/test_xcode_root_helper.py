@@ -48,7 +48,8 @@ if [[ "$1" == -p ]]; then [[ -s {self.selected} ]] || exit 1; cat {self.selected
 ''')
         executable(bin_dir / "spctl", f'echo "spctl $*" >> {self.log}; [[ "$(cat {self.signed})" == yes ]]\n')
         executable(bin_dir / "rm", f'echo "rm $*" >> {self.log}\n')
-        executable(bin_dir / "codesign", f'echo "codesign $*" >> {self.log}; [[ "$(cat {self.signed})" == yes ]]\n')
+        # A valid signature alone is not enough: the fake only accepts Apple's Xcode requirement.
+        executable(bin_dir / "codesign", f'echo "codesign $*" >> {self.log}; [[ "$*" == *"-R=identifier \\"com.apple.dt.Xcode\\" and anchor apple"* && "$(cat {self.signed})" == yes ]]\n')
         executable(bin_dir / "mv", f'echo "mv $*" >> {self.log}; /bin/mv "$@"\n')
         executable(bin_dir / "cp", f'echo "cp $*" >> {self.log}; /bin/cp "$@"\n')
         # Fakes for root-only steps: record, and make the tree read-only the way
@@ -81,6 +82,7 @@ if [[ "$1" == -p ]]; then [[ -s {self.selected} ]] || exit 1; cat {self.selected
         app = self.work / "xcode-27.2-abc/Xcode.app"
         evil = self.root / "evil-ran"
         executable(app / "Contents/Developer/usr/bin/xcodebuild", f'''echo "xcodebuild $0 $*" >> {self.log}
+echo "home $HOME" >> {self.log}
 if [[ "$1" == -version ]]; then printf '%s\\nBuild version 27B52\\n' "{version_line}"; exit 0; fi
 # Race attempts: rewrite the original path and this binary.
 mkdir -p "{app}/Contents/Developer/usr/bin" 2>/dev/null
@@ -157,13 +159,15 @@ exit 0
         self.assertEqual(code, 0, stderr)
         quarantined = self.quarantine / "Xcode_27.2.app"
         binary = quarantined / "Contents/Developer/usr/bin/xcodebuild"
-        self.assertEqual(log[:5], [f"cp -Rc {source} {quarantined}", f"chown -R root:wheel {quarantined}", f"chmod -R go-w {quarantined}",
-                                   f"codesign --verify --deep --strict {quarantined}", f"spctl --assess --type execute {quarantined}"])
+        self.assertEqual(log[:6], [f"cp -Rc {source} {quarantined}", f"chown -R root:wheel {quarantined}", f"chmod -R go-w {quarantined}",
+                                   f"chmod -R -N {quarantined}",
+                                   f'codesign --verify --deep --strict -R=identifier "com.apple.dt.Xcode" and anchor apple {quarantined}',
+                                   f"spctl --assess --type execute {quarantined}"])
         executed = [line for line in log if line.startswith("xcodebuild ")]
         self.assertEqual(executed, [f"xcodebuild {binary} -version", f"xcodebuild {binary} -license accept",
                                     f"xcodebuild {binary} -runFirstLaunch"])
         self.assertIn("rewrite-refused", log)
-        self.assertEqual(log[-1], f"mv {quarantined} {self.apps}/Xcode_27.2.app")
+        self.assertEqual(log[-1], f"mv -h {quarantined} {self.apps}/Xcode_27.2.app")
         self.assertFalse(evil.exists())
         self.assertTrue((self.apps / "Xcode_27.2.app/Contents/Developer/usr/bin/xcodebuild").is_file())
         # Root never deletes the user-controlled source; the controller's temporary directory does.
@@ -278,6 +282,32 @@ exit 0
         self.assertEqual(code, 1)
         self.assertIn("cannot read the selected Xcode", stderr)
         self.assertFalse(any(line.startswith("rm") for line in log))
+
+    def test_root_runs_xcodebuild_with_a_clean_environment(self):
+        app, _ = self.expanded()
+        code, _, log = self.call("install", app, "27.2")
+        self.assertEqual(code, 0)
+        self.assertEqual([line for line in log if line.startswith("home ")], ["home /var/root"] * 3)
+
+    def test_codesign_must_be_asked_for_apples_requirement(self):
+        source = SCRIPT.read_text()
+        self.assertIn("""REQUIREMENT='identifier "com.apple.dt.Xcode" and anchor apple'""", source)
+        self.assertIn('--verify --deep --strict -R="$REQUIREMENT"', source)
+        app, _ = self.expanded()
+        # Drop the requirement from the fake's acceptance: the script must still pass it.
+        code, _, log = self.call("install", app, "27.2")
+        self.assertEqual(code, 0)
+        self.assertTrue(any(line.startswith("codesign --verify --deep --strict -R=identifier") for line in log))
+
+    def test_target_replaced_during_install_is_refused_after_the_move(self):
+        app, evil = self.expanded()
+        # Simulate the race: a directory appears at the target just before the final move.
+        executable(self.root / "bin/mv", f'echo "mv $*" >> {self.log}; /bin/mkdir -p "${{@: -1}}"; /bin/mv "$@"\n')
+        code, stderr, log = self.call("install", app, "27.2")
+        self.assertEqual(code, 1)
+        self.assertIn("was replaced during install", stderr)
+        self.assertTrue((self.apps / "Xcode_27.2.app/Xcode_27.2.app/Contents").is_dir())
+        self.assertFalse(evil.exists())
 
 
 if __name__ == "__main__":

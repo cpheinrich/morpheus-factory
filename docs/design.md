@@ -256,8 +256,11 @@ recorded with its actual output.
   copy-on-write) into a root-only quarantine (`/var/root/morpheus-factory-xcode`);
   a clone rather than a move, because a write handle the user already holds on
   a moved file still works, while a clone's bytes are out of its reach. It makes it root-owned and
-  unwritable, and only then verifies it (`codesign --deep --strict`, `spctl`,
-  the reported version), runs `-license accept` and `-runFirstLaunch`, and moves
+  unwritable, and only then verifies it (`codesign --deep --strict` against
+  Xcode's designated requirement `identifier "com.apple.dt.Xcode" and anchor
+  apple`, because a valid signature alone admits any notarized Developer ID
+  bundle, then `spctl`, then the reported version), runs `-license accept` and
+  `-runFirstLaunch` with a clean root environment, and moves
   it into `/Applications`; a failure leaves it in quarantine for manual
   `sudo rm -rf`. `select` and `remove` run no bundle code as root; what they
   leave a CI job is integrity and availability exposure (switching to another

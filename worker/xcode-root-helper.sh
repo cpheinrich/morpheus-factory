@@ -26,6 +26,10 @@ MKDIR=/bin/mkdir
 CHOWN=/usr/sbin/chown
 CHMOD=/bin/chmod
 STAT=/usr/bin/stat
+ENV=/usr/bin/env
+# Only Apple's own Xcode may run as root: a valid signature alone would admit any
+# notarized Developer ID bundle named Xcode.app. This is Xcode's designated requirement.
+REQUIREMENT='identifier "com.apple.dt.Xcode" and anchor apple'
 
 usage() {
   echo "usage: morpheus-factory-xcode install <expanded Xcode.app> <version> | select <app> | remove /Applications/Xcode_<version>.app" >&2
@@ -57,20 +61,26 @@ if [[ "$verb" == install ]]; then
   # still holds on the original cannot reach the copy's bytes. The source is
   # never deleted as root; the controller's temporary directory removes it.
   "$MKDIR" -p -m 700 "$QUARANTINE"
-  "$CP" -Rc "$src" "$quarantined" || refuse "could not clone $src into $QUARANTINE (it must be on the same APFS volume)"
+  "$CP" -Rc "$src" "$quarantined" || refuse "could not copy $src into $QUARANTINE"
   [[ -d "$quarantined" && ! -L "$quarantined" ]] || refuse "clone of $src is not a directory; inspect and sudo rm -rf $quarantined"
   trap 'echo "morpheus-factory-xcode: install failed; the bundle is left in $quarantined (remove with sudo rm -rf $quarantined)" >&2' ERR
   "$CHOWN" -R root:wheel "$quarantined"
   "$CHMOD" -R go-w "$quarantined"
-  "$CODESIGN" --verify --deep --strict "$quarantined" >/dev/null 2>&1 || refuse "codesign rejected $quarantined; it is left there (sudo rm -rf $quarantined)"
+  "$CHMOD" -R -N "$quarantined"
+  "$CODESIGN" --verify --deep --strict -R="$REQUIREMENT" "$quarantined" >/dev/null 2>&1 || refuse "codesign rejected $quarantined as Apple's Xcode; it is left there (sudo rm -rf $quarantined)"
   "$SPCTL" --assess --type execute "$quarantined" >/dev/null 2>&1 || refuse "spctl rejected $quarantined; it is left there (sudo rm -rf $quarantined)"
-  xcodebuild="$quarantined/Contents/Developer/usr/bin/xcodebuild"
-  reported="$("$xcodebuild" -version)" || refuse "xcodebuild -version failed in $quarantined"
+  # Root runs the bundle's xcodebuild with a clean environment: nothing the
+  # worker user exported (HOME included) reaches it.
+  xcodebuild=("$ENV" -i HOME=/var/root PATH="$PATH" "$quarantined/Contents/Developer/usr/bin/xcodebuild")
+  reported="$("${xcodebuild[@]}" -version)" || refuse "xcodebuild -version failed in $quarantined"
   [[ "${reported%%$'\n'*}" == "Xcode $version" ]] || refuse "$quarantined is not Xcode $version; it is left there (sudo rm -rf $quarantined)"
-  "$xcodebuild" -license accept
-  "$xcodebuild" -runFirstLaunch
+  "${xcodebuild[@]}" -license accept
+  "${xcodebuild[@]}" -runFirstLaunch
   [[ ! -e "$target" && ! -L "$target" ]] || refuse "$target appeared during install; the bundle is left in $quarantined"
-  "$MV" "$quarantined" "$target"
+  # -h: never follow a symlink that appeared at the target. If a directory
+  # appeared there instead, mv moved the bundle inside it; say so and stop.
+  "$MV" -h "$quarantined" "$target"
+  [[ -d "$target/Contents" && ! -e "$target/Xcode_$version.app" ]] || refuse "$target was replaced during install; the bundle is at $target/Xcode_$version.app"
   exit 0
 fi
 
