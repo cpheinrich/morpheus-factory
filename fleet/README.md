@@ -31,11 +31,11 @@ shows the hold.
 3. If `phase` is `"stage"`, hold (`held-at-stage`) before touching the consumer:
    a held pin opens no consumer PR and spends no agent runs. `"promote"` or
    absent goes on.
-4. Require **merged consumer main** to carry the pin: every `xcode-version:` and
-   every `xcode-<X>` runner label in `.github/workflows/*.yml` equals the pin,
-   at least one workflow sets `xcode-version:`, and every `Xcode <x>`,
-   `Xcode\ <x>` and `Build version <b>` token in the assertion script equals
-   the pin (at least one of each; 27.21 is not 27.2). No workflow names are listed;
+4. Require **merged consumer main** to carry the pin: in every tracked file
+   matching `consumer.pinPaths`, every pin token (see *One pattern set* below)
+   and every `xcode-<X>` label on a workflow `runner:`/`runs-on:` line equals the
+   pin, with at least one version and one build token across them all (27.21 is
+   not 27.2; nothing found is not a pass). No workflow names are listed;
    `consumer.ignorePaths` names lanes the consumer keeps on an older Xcode on
    purpose (Evo's `cd-v2-*.yml` until its deletion), which are neither judged
    nor rewritten. A host that already selects the pin reports `host-converged`
@@ -77,10 +77,10 @@ When consumer main is not pinned, the controller opens a deterministic **draft**
 PR on branch `factory/xcode-<version>-<build>`: in a temporary detached worktree
 of `origin/main` it reads the old version/build from the assertion script and
 rewrites them in the tracked files matching `consumer.pinPaths`
-(`xcode-version`, `xcode-<v>` labels, `Xcode_<v>.app`, `Xcode <v>`, `Xcode\ <v>`,
-`Build version <b>`, bare `<b>`). An unreadable assertion, a substitution that
-changes nothing, or a rewritten file that still contains the old version or
-build in any form is an error, not agent work. An existing branch or open PR is
+with the same pattern set. An unreadable assertion, a substitution that
+changes nothing, or a rewritten file in which a pattern (or an unknown
+`Xcode<sep><old>` form) still finds the old version or build is an error, not
+agent work. An existing branch or open PR is
 reused, never rewritten. A closed, unmerged PR for the branch is an operator's
 rejection while its branch exists: the result is `waiting-human: consumer pin
 PR <url> was closed; delete branch <branch> to retry`, and no new PR is opened.
@@ -102,13 +102,25 @@ Results: `held: …`, `waiting-host-stage`, `waiting-consumer-pr`, `waiting-cons
 `host-converged (previous Xcode kept until delivery is green)`,
 `host-converged (retired: …)`, `host-converged (retire deferred: host busy)`.
 
+## One pattern set
+
+`PIN_PATTERNS` in `controller.py` is the only list of places a pin is written:
+`xcode-version: <v>`, the `xcode-<v>` label token, `Xcode_<v>.app`, `Xcode <v>`,
+`Xcode\ <v>`, the constant `XCODE_VERSION = '<v>'` (JS, TS or Python), `Build
+version <b>`, and the bare `<b>` (rewrite-only: unanchored, a build cannot be told
+from a timestamp). The pin check reads tokens with it and the pin PR rewrites
+with it, so a new form is added once. Templated values such as
+`${{ needs.plan.outputs.xcode-version }}` are not tokens; the literal they come
+from is. Since darwin-health/evo#715 that literal is `XCODE_VERSION` in
+`apps/ios/scripts/ci/delivery/v3.mjs`, which is therefore a pin path.
+
 ## Manifest fields
 
 ```json
 "consumer": {
   "repository": "darwin-health/evo",
   "assertion": "apps/ios/scripts/ci/assert-xcode-build.sh",
-  "pinPaths": [".github/workflows/*.yml", "apps/ios/scripts/ci/assert-xcode-build.sh"],
+  "pinPaths": [".github/workflows/*.yml", "apps/ios/scripts/ci/assert-xcode-build.sh", "apps/ios/scripts/ci/delivery/v3.mjs"],
   "ignorePaths": [".github/workflows/cd-v2-*.yml"],
   "exceptions": [{"path": ".github/workflows/ios-delivery.yml", "version": "26.6", "reason": "…"}],
   "deliveryWorkflow": "ios-delivery.yml"
@@ -125,9 +137,10 @@ reason; remove it when the lane returns to the pin.
 `deliveryWorkflow` is the workflow file whose green run on main validates a
 pin for retirement (default `ios-delivery.yml`).
 
-Optional and top-level; those are the defaults except `ignorePaths`, which
-defaults to none and is set in the reviewed manifest while Evo's CD V2 lane
-still exists. Paths must be relative with no
+Optional and top-level; those are the defaults except `ignorePaths` (default
+none; set while Evo's CD V2 lane still exists), `exceptions` (default none) and
+the `v3.mjs` pin path, which the reviewed manifest adds to the default
+`pinPaths`. Paths must be relative with no
 `..`. Each host may set `paths.consumer`, `paths.hostSetup` and
 `paths.credentialsProject` (absolute); `--consumer-root` (alias `--evo-root`),
 `--host-setup-root` and `--credentials-project` override them.

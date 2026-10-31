@@ -37,19 +37,39 @@ AGENT_RUN_CAP = 3
 AGENT_TIMEOUT_SECONDS = 7200
 DEFAULT_ASSERTION = "apps/ios/scripts/ci/assert-xcode-build.sh"
 WORKFLOW_DIR = ".github/workflows/"
-# Values are captured whole, so a templated or stray value fails the pin check
-# instead of being skipped.
-XCODE_VERSION_VALUE = re.compile(r"(?m)^[\s-]*xcode-version:\s*['\"]?([^'\"\s#]+)")
+# Workflow runner lines are also judged for any xcode-<label>, so a stale
+# non-numeric label such as xcode-latest fails too.
 RUNNER_LINE = re.compile(r"(?m)^[\s-]*(?:runner|runs-on):[^\n]*")
 RUNNER_LABEL = re.compile(r"(?<![\w-])xcode-([A-Za-z0-9._]+)")
 # A version token ends where neither a word character nor ".<digit>" follows,
 # so 27.2 does not match inside 27.21 or 27.2.1.
 VERSION_END = r"(?![\w]|\.\d)"
-# Evo's script writes the identity both as "Xcode 27.2" and, inside [[ ]], as
-# the backslash-escaped "Xcode\ 27.2".
-XCODE_SPACE = r"Xcode(?: |\\ )"
-ASSERTION_VERSIONS = re.compile(r"(?<![\w/])" + XCODE_SPACE + r"([0-9]+(?:\.[0-9]+)*)")
-ASSERTION_BUILDS = re.compile(r"Build version ([A-Za-z0-9]+)")
+VERSION_TOKEN = r"[0-9]+(?:\.[0-9]+)*"
+# The one set of places a pin is written, as (kind, before, token shape, after). The pin check reads tokens with it and the pin PR rewrites with it, so a
+# new form is added here once. Templated values (${{ ... }}, ${XCODE_VERSION})
+# are not tokens: the literal they come from is. A shape of None marks a
+# rewrite-only form: a bare build such as 27B52 is safe to rewrite as the exact
+# old literal, but unanchored it cannot be told from data (a 2026-10-06T1600
+# timestamp in an Evo comment has the same shape), so it is not read as a token.
+PIN_PATTERNS = (
+    ("version", r"xcode-version:\s*['\"]?", VERSION_TOKEN, VERSION_END),
+    ("version", r"(?<![\w-])xcode-", VERSION_TOKEN, VERSION_END),          # runner label token
+    ("version", r"\bXcode_", VERSION_TOKEN, r"(?=\.app)"),
+    ("version", r"(?<![\w/])Xcode ", VERSION_TOKEN, VERSION_END),
+    ("version", r"(?<![\w/])Xcode\\ ", VERSION_TOKEN, VERSION_END),        # Evo's [[ ]] escaped space
+    ("version", r"\bXCODE_VERSION\s*=\s*['\"]", VERSION_TOKEN, r"(?=['\"])"),  # JS/TS/Python constant
+    ("build", r"Build version ", r"[A-Za-z0-9]+", r"(?![A-Za-z0-9])"),
+    ("build", r"(?<![A-Za-z0-9])", None, r"(?![A-Za-z0-9])"),              # bare build token
+)
+
+
+def pin_tokens(text: str) -> tuple[list[str], list[str]]:
+    """Every pinned version and build literal in text, by PIN_PATTERNS."""
+    found = {"version": [], "build": []}
+    for kind, before, shape, after in PIN_PATTERNS:
+        if shape is not None:
+            found[kind] += re.findall(before + "(" + shape + ")" + after, text)
+    return found["version"], found["build"]
 
 
 class FleetError(Exception):
@@ -182,63 +202,65 @@ def git_file(repo: Path, ref: str, path: str) -> str:
     return command(["git", "-C", str(repo), "show", f"{ref}:{path}"])
 
 
+def path_matches(path: str, pattern: str) -> bool:
+    """Glob match segment by segment, as Path.glob does: * never crosses a /."""
+    parts, globs = path.split("/"), pattern.split("/")
+    return len(parts) == len(globs) and all(fnmatch.fnmatchcase(part, glob) for part, glob in zip(parts, globs))
+
+
 def consumer_has_pin(root: Path, pin: Pin, consumer: Consumer) -> bool:
     """Inspect merged consumer main; a PR branch alone never advances the fleet."""
     command(["git", "-C", str(root), "fetch", "origin", "main"])
-    listing = command(["git", "-C", str(root), "ls-tree", "--name-only", "origin/main", WORKFLOW_DIR])
-    pinned_somewhere = False
+    listing = command(["git", "-C", str(root), "ls-tree", "-r", "--name-only", "origin/main"])
+    any_version = any_build = False
     for path in (line.strip() for line in listing.splitlines()):
-        if not path.endswith(".yml") or consumer.ignores(path):
+        if not any(path_matches(path, pattern) for pattern in consumer.pin_paths) or consumer.ignores(path):
             continue
         body = git_file(root, "origin/main", path)
-        versions = [v for v in XCODE_VERSION_VALUE.findall(body) if not consumer.excepted(path, v)]
-        if any(version != pin.version for version in versions):
+        versions, builds = pin_tokens(body)
+        if path.endswith((".yml", ".yaml")):
+            versions += [label for line in RUNNER_LINE.findall(body) for label in RUNNER_LABEL.findall(line)]
+        versions = [version for version in versions if not consumer.excepted(path, version)]
+        # Every token must be the pin: a substring test would accept 27.21 for
+        # 27.2, or one updated line beside a stale one.
+        if any(version != pin.version for version in versions) or any(build != pin.build for build in builds):
             return False
-        labels = [label for line in RUNNER_LINE.findall(body) for label in RUNNER_LABEL.findall(line)]
-        if any(label != pin.version and not consumer.excepted(path, label) for label in labels):
-            return False
-        pinned_somewhere = pinned_somewhere or bool(versions)
+        any_version, any_build = any_version or bool(versions), any_build or bool(builds)
     # An empty match set is not a pass: nothing pinned is not correctly pinned.
-    if not pinned_somewhere:
-        return False
-    try:
-        assertion = git_file(root, "origin/main", consumer.assertion)
-    except FleetError:
-        return False
-    # Every identity token must be the pin; a substring test would accept 27.21
-    # for 27.2, or one updated line beside a stale one.
-    versions, builds = ASSERTION_VERSIONS.findall(assertion), ASSERTION_BUILDS.findall(assertion)
-    return (bool(versions) and bool(builds) and all(version == pin.version for version in versions)
-            and all(build == pin.build for build in builds))
+    return any_version and any_build
 
 
 def assertion_pin(assertion: str) -> tuple[str, str]:
-    # The script compares against $'Xcode 27.2\nBuild version 27B52': the literal
-    # backslash-n before "Build" means no word boundary precedes it.
-    version = re.search(r"(?<![\w/])Xcode ([0-9]+(?:\.[0-9]+){1,2})" + VERSION_END, assertion)
-    build = re.search(r"Build version ([A-Za-z0-9]+)(?![A-Za-z0-9])", assertion)
-    if not version or not build:
-        raise FleetError("cannot read the current Xcode version and build from the consumer assertion")
-    return version.group(1), build.group(1)
+    versions, builds = pin_tokens(assertion)
+    if len(set(versions)) != 1 or len(set(builds)) != 1:
+        raise FleetError("cannot read one current Xcode version and build from the consumer assertion")
+    return versions[0], builds[0]
+
+
+def _old_pattern(before: str, value: str, after: str) -> str:
+    return "(" + before + ")" + re.escape(value) + after
 
 
 def substitute_pin(text: str, old: tuple[str, str], new: Pin) -> str:
-    old_version, old_build = (re.escape(part) for part in old)
-    text = re.sub(r"(xcode-version:\s*['\"]?)" + old_version + VERSION_END, lambda m: m.group(1) + new.version, text)
-    text = re.sub(r"(?<![\w-])xcode-" + old_version + VERSION_END, "xcode-" + new.version, text)
-    text = re.sub(r"\bXcode_" + old_version + r"\.app", f"Xcode_{new.version}.app", text)
-    text = re.sub(r"(?<![\w/])Xcode " + old_version + VERSION_END, "Xcode " + new.version, text)
-    text = re.sub(r"(?<![\w/])Xcode\\ " + old_version + VERSION_END, lambda m: "Xcode\\ " + new.version, text)
-    text = re.sub(r"Build version " + old_build + r"(?![A-Za-z0-9])", "Build version " + new.build, text)
-    return re.sub(r"\b" + old_build + r"\b", new.build, text)
+    for kind, before, _shape, after in PIN_PATTERNS:
+        value, replacement = (old[0], new.version) if kind == "version" else (old[1], new.build)
+        text = re.sub(_old_pattern(before, value, after), lambda m, r=replacement: m.group(1) + r, text)
+    return text
 
 
 def residual_pin(text: str, old: tuple[str, str], new: Pin) -> bool:
-    """True when the old version or build survives substitution in any form."""
-    old_version, old_build = old
-    if old_version != new.version and re.search(r"(?<![0-9.])" + re.escape(old_version) + VERSION_END, text):
-        return True
-    return old_build != new.build and re.search(r"(?<![A-Za-z0-9])" + re.escape(old_build) + r"(?![A-Za-z0-9])", text) is not None
+    """True when the old version or build survives substitution.
+
+    PIN_PATTERNS covers the known forms. The extra net catches the old version
+    written next to "Xcode" in a form the set does not know (Xcode-26.6,
+    XCODE_26.6), which would otherwise leave a half-pinned file the check also
+    cannot see. Prose such as "a move off 27.2" is neither judged nor refused.
+    """
+    for kind, before, _shape, after in PIN_PATTERNS:
+        value, replacement = (old[0], new.version) if kind == "version" else (old[1], new.build)
+        if value != replacement and re.search(_old_pattern(before, value, after), text):
+            return True
+    return old[0] != new.version and re.search(r"(?i)xcode[\W_]{0,2}" + re.escape(old[0]) + VERSION_END, text) is not None
 
 
 def rewrite_pin_files(worktree: Path, tracked: set[str], patterns: tuple[str, ...], old: tuple[str, str], new: Pin,

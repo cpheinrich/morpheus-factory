@@ -5,7 +5,8 @@
     "assertion": "apps/ios/scripts/ci/assert-xcode-build.sh",
     "pinPaths": [
       ".github/workflows/*.yml",
-      "apps/ios/scripts/ci/assert-xcode-build.sh"
+      "apps/ios/scripts/ci/assert-xcode-build.sh",
+      "apps/ios/scripts/ci/delivery/v3.mjs"
     ],
     "ignorePaths": [
       ".github/workflows/cd-v2-*.yml"
