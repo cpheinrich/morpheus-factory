@@ -120,6 +120,40 @@ A helper that writes these files for a given base URL and keys:
 scripts/configure-client.sh <BASE> <CLAUDE_KEY> <CODEX_KEY>
 ```
 
+## Delegation rule (quota-based routing)
+
+`scripts/route.sh` is the simplest form of the "use the pooled subscription
+before your own" rule. It reads the account's current usage from the sub2api
+admin API and routes a CLI invocation to the gateway while there is headroom,
+falling back to the host's native login once the subscription is near
+exhausted.
+
+```sh
+route.sh claude [claude args...]   # routes Claude Code
+route.sh codex  [codex args...]    # routes Codex
+```
+
+Configuration (environment):
+
+| Var | Meaning | Default |
+|---|---|---|
+| `SUB2API_ADMIN_URL` | admin origin | `http://localhost:8080` |
+| `SUB2API_ADMIN_EMAIL` | admin login | `admin@sub2api.local` |
+| `SUB2API_ADMIN_PASSWORD` | admin password | *(required)* |
+| `SUB2API_GATEWAY_URL` | gateway origin for CLIs | `= ADMIN_URL` |
+| `SUB2API_CLAUDE_KEY` / `SUB2API_CODEX_KEY` | `sk-` keys | *(required to route)* |
+| `SUB2API_THRESHOLD` | stop using sub2api at/above this % | `80` |
+
+The quota signal comes from `GET /api/v1/admin/accounts` (admin JWT): Claude's
+`extra.session_window_utilization` (0–1) and Codex's
+`extra.codex_7d_used_percent` / `extra.codex_5h_used_percent` (0–100). It
+**fails closed** — if usage can't be read, the invocation runs native rather
+than guessing the pooled subscription has capacity.
+
+This is deliberately a thin wrapper, not the factory broker. When this PoC is
+wired into factory, the same signal should be published as the stable
+`/factory/v1/capacity` document the broker port already expects.
+
 ## Verified
 
 - `GET /health` → 200 (localhost, tailnet IP, and MagicDNS name).
