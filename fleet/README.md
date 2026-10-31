@@ -1,60 +1,82 @@
 # Fleet Xcode updates
 
-`controller.py` is the single entry point for the reviewed `worker/updates.json`
-pin. The existing hourly runner fast-forwards Factory main, then calls it through
-`with_github.py`. One LaunchAgent and one protected-main fetch serve the full
-sequence; the fleet controller has its own lock and a private 0600 session record.
+`controller.py` carries the exact `version`/`build` pin in `worker/updates.json`
+across a host, its CI image and the consumer repository. The hourly runner
+fast-forwards Factory main and calls it through `with_github.py`. The controller
+holds its own lock; each tick re-reads repository and host state and does one
+bounded step.
 
-For each exact `version`/`build` pin, reconciliation proceeds in order:
+## Hosts
 
-1. Stage the approved app through the Evo credentials companion. A new pin is
-   not selected at this step, even if its manifest phase says `promote`.
-2. Fast-forward a clean `agent-host-setup` main checkout, then ask `image-stage`
-   to build or verify the exact Tart guest image and activate
-   Evo's version-specific runner pool. It checks the guest build, not its name.
-3. Inspect **merged Evo main** for the four iOS workflow pins and exact-build
-   assertion. If it differs, run a bounded Codex task in an isolated Factory
-   worktree to finish Evo's tests, independent review, CI, PR and merge. Resume
-   its session on the next tick if the merged code is still behind.
-4. When Evo main is pinned, run a second task to merge Factory's `stage` →
-   `promote` manifest PR, if needed. Only then call the host reconciler to
-   validate with `DEVELOPER_DIR`, switch `xcode-select`, and roll back a failed
-   switch. An accidentally early `promote` phase cannot bypass the image/CI gate.
-5. Report host convergence only after that host selects the approved build. The
-   image and pool checks repeat on subsequent ticks, using the host-side
-   verified receipt for a cheap unchanged-image check.
+| Host | `role` | What reconcile does |
+|---|---|---|
+| Zoe's Mac mini | `ci-image` (has a `ci` block) | Stages Xcode, fast-forwards `agent-host-setup`, runs `image-stage` to build/verify the `xcode-27.2` Tart image and activate the runner pool that runs Evo's simulator tests and uploads, then promotes. |
+| MacBook Pro | `phone-gate` (no `ci` block) | Physical-iPhone gate host. Builds with the host's selected Xcode: stages and promotes only, no image and no host-tool sync. |
 
-No task directly pushes protected main. A successful agent exit alone is not
-evidence of rollout; the controller checks merged files and host state on every
-tick. If a task or CI is delayed, the next tick resumes its persisted session.
-The controller deliberately leaves the MacBook Pro-only CD V2 lane on its current
-pin until that host can build and verify an image. A fleet report must call that
-host out as pending rather than claiming every Evo lane has converged.
+`role` defaults to `ci-image` when the entry has `ci`, otherwise `phone-gate`;
+a `ci-image` role without `ci` (or the reverse) is refused.
 
-The GitHub wrapper retrieves the selected account's existing `gh` credential
-without printing it, builds a temporary Git askpass helper, and passes only
-GitHub auth plus ordinary process variables to the fleet task. The image
-builder receives GitHub auth to fetch runner assets; worker child environments
-exclude Apple login and SMS provider values. Apple credentials and SMS tokens
-are never inherited by the PR agent. `codex exec`
-uses its existing local login and automatic approval review under the workspace
-sandbox; it does not need an OpenAI API key in this LaunchAgent.
-Pass the existing installer option `--credentials-project <path>` to the fleet
-CLI so each host runs Apple staging through its own credentials companion.
-The Evo checkout remains the consumer pin source; it is the default credentials
-project only for the current Zoe host.
-The installer-provided verification provider path and HTTPS URL pass through
-the GitHub wrapper; its broker token stays in the host credentials companion.
+## Order
 
-After the host runner integration is merged, check status with:
+1. Stage the approved app through the host's credentials companion.
+2. `ci-image` hosts only: sync host tools and run `image-stage`.
+3. Require **merged consumer main** to carry the pin: every `xcode-version:` and
+   every `xcode-<X>` runner label in `.github/workflows/*.yml` equals the pin,
+   at least one workflow sets `xcode-version:`, and the assertion script names
+   `Xcode <version>` and `Build version <build>`. No workflow names are listed.
+4. If `phase` is `"stage"`, hold (`held-at-stage`). `"promote"` or absent goes on.
+5. Run the host reconciler (validate with `DEVELOPER_DIR`, switch `xcode-select`,
+   roll back a failed switch) and report `host-converged` once it is selected.
+
+## Consumer pin PR
+
+When consumer main is not pinned, the controller opens a deterministic **draft**
+PR on branch `factory/xcode-<version>-<build>`: in a temporary detached worktree
+of `origin/main` it reads the old version/build from the assertion script and
+rewrites them in the tracked files matching `consumer.pinPaths`
+(`xcode-version`, `xcode-<v>` labels, `Xcode_<v>.app`, `Xcode <v>`,
+`Build version <b>`, bare `<b>`). An unreadable assertion or a substitution that
+changes nothing is an error, not agent work. An existing branch or open PR is
+reused, never rewritten.
+
+On a later tick, if that PR has still not merged, one **fresh** `codex exec`
+run (no resume, killed after 2 h) is asked to finish it under the consumer's
+normal review and CI rules. At most **3 runs per pin**; after that the result is
+`waiting-human: consumer pin PR <url> needs attention`. No agent pushes protected
+main or opens a second PR.
+
+Results: `waiting-host-stage`, `waiting-consumer-pr`, `waiting-consumer-merge`,
+`waiting-human: …`, `held-at-stage`, `waiting-host-promotion`, `host-converged`.
+
+## Manifest fields
+
+```json
+"consumer": {
+  "repository": "darwin-health/evo",
+  "assertion": "apps/ios/scripts/ci/assert-xcode-build.sh",
+  "pinPaths": [".github/workflows/*.yml", "apps/ios/scripts/ci/assert-xcode-build.sh"]
+}
+```
+
+Optional and top-level; those are the defaults. Paths must be relative with no
+`..`. Each host may set `paths.consumer`, `paths.hostSetup` and
+`paths.credentialsProject` (absolute); `--consumer-root` (alias `--evo-root`),
+`--host-setup-root` and `--credentials-project` override them.
+
+## Credentials and state
+
+`with_github.py` passes only GitHub auth (via a temporary askpass helper) and
+ordinary process variables to the controller; Apple credentials and SMS tokens
+stay in the host credentials companion and never reach the PR or the agent.
+Non-image host actions also drop the GitHub variables. `codex exec` uses its
+existing local login.
 
 ```sh
 python3 fleet/controller.py status --host zoe-mac-mini
 ```
 
-The hourly job's result and errors are in
-`~/Library/Logs/morpheus-factory/host-updates.log`. The fleet session record is
-`~/.local/state/morpheus-factory/fleet/fleet.json`; it contains a Codex session
-ID and pin only, not credentials or verification codes. On a new pin the old
-session is discarded. A controller error leaves the selected Xcode and old
-runner image available for rollback.
+prints the pin, phase, role, host status and `consumerPinned` (`null` when it
+cannot be determined). Logs: `~/Library/Logs/morpheus-factory/host-updates.log`.
+State: `~/.local/state/morpheus-factory/fleet/fleet.json`, mode 0600, shaped
+`{"pin": "<version>-<build>", "agentRuns": [<ISO timestamps>]}`; it resets on a
+new pin and holds no credentials.
