@@ -189,3 +189,98 @@ an outage — otherwise the gate quietly disappears whenever a broker misbehaves
   layer, not to keep patching it.
 - A provider shipping a documented first-party delegation mechanism: the
   emulation risk disappears and the broker becomes a plain router.
+
+## Host updates for the stateless Evo delivery pipeline — 2026-10-30
+
+Mandate, recorded for a successor session. Chris delegated this outcome in the
+Claude session "morpheus-factory worker setup" with CTO authority, no hard token
+budget, and the MacBook Air as the test host (it may register as a runner and
+change its Xcode). The brief: review [issue #9](https://github.com/cpheinrich/morpheus-factory/issues/9)
+from the Evo CD session, form an independent view, implement the improvements,
+test them on the Air, and merge. Authority covers this repository, the Air, and a
+temporary runner registration; it does not cover the MacBook Pro tonight (an Evo
+delivery run is using its selected Xcode), `device-runner/` in agent-host-setup
+(another session is changing it), or any secret.
+
+**Acceptance.** (1) `fleet/controller.py` judges Evo's pin without naming the
+workflows Evo is deleting, and no hourly tick can start an unbounded agent loop.
+(2) The two agent steps are deterministic pull requests; an agent runs only
+when a mechanical PR cannot merge on its own, fresh and time-boxed, with a cap
+per pin. (3) A host entry is portable: paths, Apple credential names and the
+credentials project are per-host manifest fields, and `check` refuses before any
+download when sudo rights, credentials, disk, the runner LaunchAgent, signing
+identities or the paired phone are wrong. (4) `activate` defers while a runner
+job is live. (5) Promotion keeps the selected Xcode plus one previous and removes
+older `Xcode_<version>.app` bundles. (6) The MacBook Pro has a phone-gate host
+entry whose validation is a signed device build. (7) Everything above is covered
+by unit tests, and the Air run of `setup.sh`, `check` and the runner install is
+recorded with its actual output.
+
+**Decisions.**
+
+- *The `phase` gate is now an optional hold, not a step an agent flips.* The
+  controller already refuses to switch a host before the image is verified, the
+  consumer's main carries the pin and the host validation passes; a mechanical
+  phase flip after those gates added a PR and an agent run and no judgment.
+  `phase: "stage"` still holds a host at staging when an operator wants that.
+- *Consumer pin PRs are substitutions, not prompts.* The current pin is read
+  from Evo's assertion script on main; every workflow and script under the
+  declared paths has the old version and build replaced by the new ones, and
+  the PR is opened as a draft under Evo's normal gates. A fresh `codex exec`
+  carries it through tests, review and merge only when the draft is still open
+  on a later tick, at most three times per pin; after that the tick reports and
+  spends nothing.
+- *Unused simulator runtimes are not deleted.* Runtimes are shared by every
+  Xcode on the host and by CI's pinned destination OS; removing one can break a
+  job that never asked for an Xcode change. Only `Xcode_<version>.app` bundles
+  beyond the retained two are removed.
+- *Generic persistent runners get a Factory-owned LaunchAgent.* The stock
+  `svc.sh` plist sets `SessionCreate`, which locks the login keychain in the
+  runner's session and breaks `codesign` with `errSecInternalComponent`
+  (proven on the Pro on 2026-10-30). Factory writes its own plist without it.
+  Evo's restricted device runner keeps its installer in agent-host-setup; Factory
+  only checks its plist.
+- *Root actions go through one Apple-signature-checking helper, not a sudoers
+  list of commands.* The first draft granted `/bin/mv`, `/bin/rm -rf --
+  /Applications/Xcode_*.app` and `xcode-select --switch *` without a password.
+  Independent review showed that is root for any process running as the worker
+  user: a bare `mv` writes anywhere, sudoers matches `*` across the whole
+  argument string, and `/Applications` is admin-writable, so a wildcard
+  `xcodebuild` path would run a planted binary as root. The host keeps one
+  root-owned helper (`worker/xcode-root-helper.sh`, installed once to
+  `/usr/local/libexec/morpheus-factory-xcode`) with three verbs. A second review
+  showed that checking a bundle with `spctl` and then executing its `xcodebuild`
+  in place is still a race: the worker user owns the bundle and can write
+  `/Applications`, so it can swap the binary or a first-launch package between
+  check and exec. So `install` clones the expanded download (`cp -Rc`, APFS
+  copy-on-write) into a root-only quarantine (`/var/root/morpheus-factory-xcode`);
+  a clone rather than a move, because a write handle the user already holds on
+  a moved file still works, while a clone's bytes are out of its reach. It makes it root-owned and
+  unwritable, and only then verifies it (`codesign --deep --strict` against
+  Xcode's designated requirement `identifier "com.apple.dt.Xcode" and anchor
+  apple`, because a valid signature alone admits any notarized Developer ID
+  bundle, then `spctl`, then the reported version), runs `-license accept` and
+  `-runFirstLaunch` with a clean root environment, and moves
+  it into `/Applications`; a failure leaves it in quarantine for manual
+  `sudo rm -rf`. `select` and `remove` run no bundle code as root; what they
+  leave a CI job is integrity and availability exposure (switching to another
+  signed Xcode, deleting a non-selected one), not root. `check` reports a
+  missing, stale or writable helper, or a writable directory above it.
+- *`xcodes` is installed from its pinned, checksummed release binary.* The
+  Homebrew tap compiles it from source and fails on macOS 27 (observed on the
+  Air; XcodesOrg/homebrew-made#4). One audited version and checksum in
+  `worker/setup/tools.sh`, the same shape as asccli in Morpheus.
+
+**Air run, 2026-10-30.** `worker/setup.sh` completed (xcodes 2.1.0 installed;
+GarageBand and iMovie left in place because `sudo -n` is unavailable);
+`update_controller.py check --host christophers-macbook-air` and
+`install_updates.py --check` reported exactly the three real gaps (passwordless
+sudo, Apple developer credentials, the phone disconnected) and passed xcodes,
+disk, paths, the single TAML3DQJTR signing identity and the validation command;
+`fleet/controller.py status` read `consumerPinned: true` from live Evo main;
+`worker/runner.sh install` registered `factory-air-test` on darwin-health/evo
+with only the `factory-air` label, GitHub listed it online, the plist had no
+`SessionCreate`, and `remove` deregistered it. Evo's signed `EvoStagingDeviceGate`
+build-for-testing passed on the Air with the connected iPhone 17 Pro Max
+(7 min 51 s); a second run after the phone disconnected failed on the missing
+destination, which is what the `device` check exists to catch early.

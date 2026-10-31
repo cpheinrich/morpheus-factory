@@ -3,10 +3,15 @@
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+
+
+UDID = re.compile(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{16}$")
 
 
 def command(argv, *, cwd=None, env=None):
@@ -16,7 +21,9 @@ def command(argv, *, cwd=None, env=None):
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
 
 
-def validate(repo: Path) -> str:
+def validate(repo: Path, device_gate: str = "") -> str:
+    if device_gate and not UDID.fullmatch(device_gate):
+        raise ValueError("device gate requires a hardware UDID")
     developer = os.environ.get("DEVELOPER_DIR", "")
     if not Path(developer).is_absolute() or not Path(developer, "usr/bin/xcodebuild").is_file():
         raise ValueError("DEVELOPER_DIR must select an installed Xcode app")
@@ -33,7 +40,10 @@ def validate(repo: Path) -> str:
             raise RuntimeError("Evo main is missing its iOS build script")
         # The host updater already limited this environment and checked the
         # exact Xcode identity; the build sees only that selected toolchain.
-        subprocess.run([str(script), "build"], cwd=checkout / "apps/ios", check=True)
+        # A phone-gate host proves the toolchain with a signed build for its
+        # connected iPhone, the same build its delivery gate runs.
+        action = ["build-device-gate", device_gate] if device_gate else ["build"]
+        subprocess.run([str(script), *action], cwd=checkout / "apps/ios", check=True)
         return sha
     finally:
         try:
@@ -46,8 +56,11 @@ def validate(repo: Path) -> str:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, required=True)
+    parser.add_argument("--device-gate", metavar="UDID", default="", help="run a signed device-gate build for this iPhone")
     args = parser.parse_args()
-    print(f"validated Evo main {validate(args.repo)[:12]}")
+    if args.device_gate and not UDID.fullmatch(args.device_gate):
+        parser.error("--device-gate requires a hardware UDID")
+    print(f"validated Evo main {validate(args.repo, args.device_gate)[:12]}")
 
 
 if __name__ == "__main__":

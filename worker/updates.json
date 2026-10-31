@@ -1,12 +1,36 @@
 {
   "schemaVersion": 1,
+  "consumer": {
+    "repository": "darwin-health/evo",
+    "assertion": "apps/ios/scripts/ci/assert-xcode-build.sh",
+    "pinPaths": [
+      ".github/workflows/*.yml",
+      "apps/ios/scripts/ci/assert-xcode-build.sh"
+    ],
+    "ignorePaths": [
+      ".github/workflows/cd-v2-*.yml"
+    ]
+  },
   "hosts": {
     "zoe-mac-mini": {
+      "role": "ci-image",
       "xcode": {
         "version": "27.2",
         "build": "27B52",
-        "components": ["MetalToolchain"],
+        "components": [
+          "MetalToolchain"
+        ],
         "phase": "promote"
+      },
+      "paths": {
+        "factory": "/Users/zoe/code/morpheus-factory",
+        "consumer": "/Users/zoe/code/evo",
+        "hostSetup": "/Users/zoe/code/agent-host-setup",
+        "credentialsProject": "/Users/zoe/code/evo"
+      },
+      "apple": {
+        "idVar": "ZOE_APPLE_ID",
+        "passwordVar": "ZOE_APPLE_ID_PASSWORD"
       },
       "verification": {
         "purpose": "apple-developer",
@@ -22,7 +46,98 @@
       },
       "validation": [
         {
-          "argv": ["/usr/bin/python3", "/Users/zoe/code/morpheus-factory/worker/validate_evo_main.py", "--repo", "/Users/zoe/code/evo"]
+          "argv": [
+            "/usr/bin/python3",
+            "/Users/zoe/code/morpheus-factory/worker/validate_evo_main.py",
+            "--repo",
+            "/Users/zoe/code/evo"
+          ]
+        }
+      ]
+    },
+    "christophers-macbook-pro": {
+      "role": "phone-gate",
+      "xcode": {
+        "version": "27.2",
+        "build": "27B52",
+        "components": [
+          "MetalToolchain"
+        ],
+        "phase": "stage"
+      },
+      "paths": {
+        "factory": "/Users/chrisheinrich/code/morpheus-factory",
+        "consumer": "/Users/chrisheinrich/code/evo",
+        "credentialsProject": "/Users/chrisheinrich/code/evo"
+      },
+      "apple": {
+        "idVar": "ZOE_APPLE_ID",
+        "passwordVar": "ZOE_APPLE_ID_PASSWORD"
+      },
+      "verification": {
+        "purpose": "apple-developer",
+        "account": "zoe-apple-developer"
+      },
+      "runner": {
+        "label": "actions.runner.darwin-health.evo-cd-mbp-device",
+        "dir": "/Users/chrisheinrich/actions-runner-evo-cd-mbp-device",
+        "requiredEnv": [
+          "MORPHEUS_CREDENTIALS_REPO"
+        ],
+        "organization": "darwin-health"
+      },
+      "signing": {
+        "identity": "Apple Development",
+        "team": "TAML3DQJTR"
+      },
+      "device": {
+        "udid": "00008120-00122CC80233401E"
+      },
+      "validation": [
+        {
+          "argv": [
+            "/usr/bin/python3",
+            "/Users/chrisheinrich/code/morpheus-factory/worker/validate_evo_main.py",
+            "--repo",
+            "/Users/chrisheinrich/code/evo",
+            "--device-gate",
+            "00008120-00122CC80233401E"
+          ]
+        }
+      ]
+    },
+    "christophers-macbook-air": {
+      "role": "phone-gate",
+      "xcode": {
+        "version": "27.2",
+        "build": "27B52",
+        "components": [
+          "MetalToolchain"
+        ],
+        "phase": "stage"
+      },
+      "paths": {
+        "factory": "/Users/chrisheinrich/code/morpheus-factory",
+        "consumer": "/Users/chrisheinrich/code/evo",
+        "credentialsProject": "/Users/chrisheinrich/code/evo"
+      },
+      "signing": {
+        "identity": "Apple Development",
+        "team": "TAML3DQJTR"
+      },
+      "device": {
+        "udid": "00008150-0015741E3AEA401C"
+      },
+      "validation": [
+        {
+          "argv": [
+            "/usr/bin/python3",
+            "/Users/chrisheinrich/code/morpheus-factory/worker/validate_evo_main.py",
+            "--repo",
+            "/Users/chrisheinrich/code/evo",
+            "--device-gate",
+            "00008150-0015741E3AEA401C"
+          ]
         }
       ]
     }

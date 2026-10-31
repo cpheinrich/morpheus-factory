@@ -14,7 +14,7 @@ while (($#)); do
   esac
 done
 [[ "$WORKER_CODE_ROOT" == /* ]] || { echo "--code-root must be an absolute path" >&2; exit 2; }
-[[ -d "$FACTORY_ROOT/.git" ]] || { echo "Run from a morpheus-factory clone" >&2; exit 1; }
+git -C "$FACTORY_ROOT" rev-parse --git-dir >/dev/null 2>&1 || { echo "Run from a morpheus-factory clone" >&2; exit 1; }
 export FACTORY_ROOT WORKER_CODE_ROOT WORKER_CHECK_ONLY
 
 for stage in prerequisites apps tools source morpheus spotlight factory cleanup; do
@@ -28,4 +28,6 @@ else
   echo "Local factory prerequisites are ready."
   echo "Fleet activation still needs a factory.json catalog, broker access, provider CLIs,"
   echo "and the Morpheus execution adapter. No provider credentials are copied by this script."
+  echo "Hosts that serve CI/CD: register a runner with worker/runner.sh install (token on stdin)."
+  echo "Xcode pins: python3 worker/install_updates.py --host <host> --credentials-project <path> (docs/host-updates.md)."
 fi
