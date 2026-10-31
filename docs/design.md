@@ -284,3 +284,44 @@ with only the `factory-air` label, GitHub listed it online, the plist had no
 build-for-testing passed on the Air with the connected iPhone 17 Pro Max
 (7 min 51 s); a second run after the phone disconnected failed on the missing
 destination, which is what the `device` check exists to catch early.
+
+## One Xcode, one CI image, explicit runtimes — 2026-10-30
+
+Two directions from Chris the same night, relayed by the Evo CD session. They
+supersede acceptance item (5) and the "retained two" bundle count above.
+
+- *Retention is one Xcode per host in steady state.* Chris: "It's fine to only
+  have the latest Xcode version. There is no reason to keep long term. During an
+  Xcode version migration we might want to temporarily keep both while we
+  validate the new version works ok, but then once the new Xcode is validated we
+  should just delete the old version." So `xcode.retain` defaults to 1, and the
+  previous app survives only through the migration window. *Validated* is three
+  facts: the host selects the pin, the consumer's merged main carries the pin,
+  and the newest completed run of the consumer's delivery workflow
+  (`consumer.deliveryWorkflow`, default `ios-delivery.yml`) on main started after
+  the host's recorded promotion and succeeded. A `gh` failure, a missing run or a
+  missing record is not validation; unknown never deletes. Phone-gate hosts use
+  the same consumer evidence. The worker records the promotion
+  (`promoted.json`); the fleet judges the evidence and calls the worker's
+  `retire`, which never runs on a busy host and refuses when the previous app is
+  the selected one.
+- *Every host serves one CI image for every repository.* Chris: "I'm not doing
+  much development of lakina or kairos on iOS right now. Don't worry about them.
+  I don't want too many versions or exceptions lying around since that creates a
+  lot of room for errors … Let's keep it all in sync and I'll worry about fixing
+  any errors in kairos or lakina later." So there is no per-repository or
+  per-host version carve-out: Lakina and Kairos move with Evo. A host's one image
+  is `ci-xcode-<pin>`, carrying the runtimes in `ci.runtimes`; agent-host-setup's
+  `activate-pool.mjs` makes it the host-wide default and empties `repoPools`, so
+  the previous `ci-xcode-*` image is unreferenced right after activation, and
+  `retire` removes it (with the previous Xcode app) through
+  `ci-vm/prune-images.mjs --apply`.
+- *Simulator runtimes are explicit and not deleted by Factory.* Evo's CI moves
+  to the iOS 27.2 runtime that ships with Xcode 27.2, with 26.5 kept alongside
+  during the switch, so the Mini's `ci.runtimes` is `["26.5", "27.2"]`. The
+  builder and verifier receive `--runtime <version>` for each, the image receipt
+  records the list (a change forces re-verification), and `check` reports any
+  listed runtime missing from the host, since the builder copies the host's
+  runtime disk images. Retirement removes Xcode apps and unreferenced images
+  only; runtimes are shared and stay. This replaces the earlier rule's reasoning
+  only in that the list is now declared; its conclusion stands.

@@ -10,7 +10,7 @@ bounded step.
 
 | Host | `role` | What reconcile does |
 |---|---|---|
-| Zoe's Mac mini | `ci-image` (has a `ci` block) | Stages Xcode, fast-forwards `agent-host-setup`, runs `image-stage` to build/verify the `xcode-27.2` Tart image and activate the runner pool that runs Evo's simulator tests and uploads, then promotes. |
+| Zoe's Mac mini | `ci-image` (has a `ci` block) | Stages Xcode, fast-forwards `agent-host-setup`, runs `image-stage` to build/verify the `ci-xcode-27.2` Tart image (with the iOS 26.5 and 27.2 simulator runtimes from `ci.runtimes`) and make it the host's one CI image for every repository, then promotes. |
 | MacBook Pro | `phone-gate` (no `ci` block) | Physical-iPhone gate host. Builds with the host's selected Xcode: stages and promotes only, no image and no host-tool sync. |
 
 `role` defaults to `ci-image` when the entry has `ci`, otherwise `phone-gate`;
@@ -42,6 +42,34 @@ shows the hold.
    without touching the consumer: the gate protects the switch, not the past.
 5. Run the host reconciler (validate with `DEVELOPER_DIR`, switch `xcode-select`,
    roll back a failed switch) and report `host-converged` once it is selected.
+6. On a converged host, [retire the previous Xcode](#retiring-the-previous-xcode)
+   once delivery has validated the pin.
+
+## Retiring the previous Xcode
+
+A host keeps one Xcode in steady state and the previous one only through the
+migration window (see [host updates](../docs/host-updates.md#retention-one-xcode-per-host)).
+On every `host-converged` tick the controller asks whether the pin is
+**validated**:
+
+1. the host selects the pin (`selectedMatches`);
+2. merged consumer main carries the pin (the same check as step 4);
+3. the newest completed run of `consumer.deliveryWorkflow` on main —
+   `gh run list --repo <consumer.repository> --workflow <deliveryWorkflow> --branch main --status completed --limit 1 --json createdAt,url,conclusion` —
+   succeeded and its `createdAt` is after the host's `promotedAt`.
+
+All three: it runs the worker's `retire` through the same credentials wrapper as
+`reconcile` (GitHub variables dropped), which prunes to `xcode.retain` (default
+1, so the previous app goes) and, on ci-image hosts, deletes unreferenced
+`ci-xcode-*` images; the result is `host-converged (retired: <apps>)`, or
+`host-converged (retire deferred: host busy)`. Otherwise, including any `gh` or
+consumer-check failure, a failed or cancelled newest run, or a run no newer than
+the promotion, it is `host-converged (previous Xcode kept until delivery is green)`
+and nothing is removed: unknown never retires. A host with no promotion record
+(it selected the pin before records existed) gets one through a `reconcile`
+first, so only a later run counts. Once `retiredAt` is recorded the tick reports
+plain `host-converged`. Phone-gate hosts have no delivery evidence of their own
+and use the same consumer evidence.
 
 ## Consumer pin PR
 
@@ -69,8 +97,10 @@ normal review and CI rules. At most **3 runs per pin**; after that the result is
 `waiting-human: consumer pin PR <url> needs attention`. No agent pushes protected
 main or opens a second PR.
 
-Results: `waiting-host-stage`, `waiting-consumer-pr`, `waiting-consumer-merge`,
-`waiting-human: …`, `held-at-stage`, `waiting-host-promotion`, `host-converged`.
+Results: `held: …`, `waiting-host-stage`, `waiting-consumer-pr`, `waiting-consumer-merge`,
+`waiting-human: …`, `held-at-stage`, `waiting-host-promotion`, `host-converged`,
+`host-converged (previous Xcode kept until delivery is green)`,
+`host-converged (retired: …)`, `host-converged (retire deferred: host busy)`.
 
 ## Manifest fields
 
@@ -80,7 +110,8 @@ Results: `waiting-host-stage`, `waiting-consumer-pr`, `waiting-consumer-merge`,
   "assertion": "apps/ios/scripts/ci/assert-xcode-build.sh",
   "pinPaths": [".github/workflows/*.yml", "apps/ios/scripts/ci/assert-xcode-build.sh"],
   "ignorePaths": [".github/workflows/cd-v2-*.yml"],
-  "exceptions": [{"path": ".github/workflows/ios-delivery.yml", "version": "26.6", "reason": "…"}]
+  "exceptions": [{"path": ".github/workflows/ios-delivery.yml", "version": "26.6", "reason": "…"}],
+  "deliveryWorkflow": "ios-delivery.yml"
 }
 ```
 
@@ -90,6 +121,9 @@ triaged). Such a value is not judged, and substitution never touches it because
 only the previous pin's tokens are rewritten; it never stands in for the pin
 itself, and the same version in any other path still fails. Each entry needs a
 reason; remove it when the lane returns to the pin.
+
+`deliveryWorkflow` is the workflow file whose green run on main validates a
+pin for retirement (default `ios-delivery.yml`).
 
 Optional and top-level; those are the defaults except `ignorePaths`, which
 defaults to none and is set in the reviewed manifest while Evo's CD V2 lane

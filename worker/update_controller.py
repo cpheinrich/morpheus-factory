@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -57,6 +58,27 @@ class CodeTimeout(UpdateError):
         self.started_at = started_at
 
 
+XCODES_CATEGORIES = (
+    # Apple's identity service answers with 503 when it is down; that is not a
+    # login problem, so it is checked before the login words.
+    (("503", "non200statuscode", "service unavailable"), "apple-unavailable: Apple returned an HTTP error; retry later"),
+    (("two-factor", "verification code", "trusted device"), "authentication-required: two-factor challenge"),
+    (("terms and conditions", "agreement"), "authentication-required: Apple Developer agreement"),
+    (("401", "403", "unauthorized"), "authentication-required: Apple refused login"),
+    (("password", "login", "sign in"), "authentication-required: Apple login"),
+    (("network", "offline", "could not connect"), "network unavailable"),
+)
+
+
+def xcodes_category(output):
+    """A fixed category for failed xcodes output; the output itself is never echoed."""
+    details = output.lower()
+    for words, category in XCODES_CATEGORIES:
+        if any(word in details for word in words):
+            return category
+    return None
+
+
 def run(argv, *, env=None, capture=True, cwd=None, timeout=None):
     if env is None:
         env = {key: os.environ[key] for key in ("HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "USER", "LOGNAME") if key in os.environ}
@@ -64,16 +86,9 @@ def run(argv, *, env=None, capture=True, cwd=None, timeout=None):
     if result.returncode:
         # Child output may contain private account information. Never echo it.
         if Path(argv[0]).name == "xcodes":
-            details = (result.stdout + result.stderr).lower()
-            for words, category in (
-                (("two-factor", "verification code", "trusted device"), "authentication-required: two-factor challenge"),
-                (("terms and conditions", "agreement"), "authentication-required: Apple Developer agreement"),
-                (("401", "403", "unauthorized"), "authentication-required: Apple refused login"),
-                (("password", "login", "sign in"), "authentication-required: Apple login"),
-                (("network", "offline", "could not connect"), "network unavailable"),
-            ):
-                if any(word in details for word in words):
-                    raise UpdateError(f"xcodes: {category}")
+            category = xcodes_category((result.stdout or "") + (result.stderr or ""))
+            if category:
+                raise UpdateError(f"xcodes: {category}")
         raise UpdateError(f"{Path(argv[0]).name} exited {result.returncode}")
     return result.stdout.strip() if capture else ""
 
@@ -141,7 +156,7 @@ def pin_for_host(manifest_path, host):
     phase = xcode.get("phase", "promote")
     if phase not in ("stage", "promote"):
         raise UpdateError("phase must be stage or promote")
-    retain = xcode.get("retain", 2)
+    retain = xcode.get("retain", 1)
     if type(retain) is not int or retain < 1:
         raise UpdateError("xcode.retain must be an integer of at least 1")
     verification = pin.get("verification")
@@ -151,6 +166,15 @@ def pin_for_host(manifest_path, host):
         if any(not isinstance(verification[key], str) or not HOST.fullmatch(verification[key]) for key in ("purpose", "account")):
             raise UpdateError("verification purpose and account must be lowercase identifiers")
     ci = pin.get("ci")
+    if ci is not None and "runtimes" in ci:
+        runtimes = ci["runtimes"]
+        # Exact iOS versions: the image builder copies these simulator runtimes
+        # from the host, and the verifier proves each is in the guest.
+        if not isinstance(runtimes, list) or not runtimes or any(not isinstance(item, str) or not VERSION.fullmatch(item) for item in runtimes) \
+                or len(set(runtimes)) != len(runtimes):
+            raise UpdateError("ci.runtimes must be a non-empty list of unique exact iOS versions")
+    if ci is not None and "imagePruner" in ci and (not isinstance(ci["imagePruner"], str) or not Path(ci["imagePruner"]).is_absolute()):
+        raise UpdateError("ci.imagePruner must be an absolute path")
     role = pin.get("role", "ci-image" if ci is not None else "phone-gate")
     if role not in ROLES:
         raise UpdateError("role must be ci-image or phone-gate")
@@ -259,19 +283,22 @@ def stage_ci_image(version, build, stage_root, verification, components, ci, app
     if matching_app(version, build) is None:
         stage(version, build, stage_root, verification, components, apple)
     image = ci["image"]
+    runtimes = list(ci.get("runtimes", []))
+    runtime_args = [argument for runtime in runtimes for argument in ("--runtime", runtime)]
     if not image_is_sealed(ci["tart"], image):
-        run([ci["builder"], "--xcode", str(app_path(version)), "--name", image], env=ci_environment(), capture=False, timeout=14400)
+        run([ci["builder"], "--xcode", str(app_path(version)), "--name", image, *runtime_args], env=ci_environment(), capture=False, timeout=14400)
     if not image_is_sealed(ci["tart"], image):
         raise UpdateError("CI image builder did not produce a sealed local image")
     identity = image_identity(image)
     receipt = stage_root / "ci-images" / f"{image}.json"
-    expected = {"image": image, "version": version, "build": build, "files": identity}
+    # The runtimes are part of the proof: a changed list forces re-verification.
+    expected = {"image": image, "version": version, "build": build, "runtimes": runtimes, "files": identity}
     try:
         cached = json.loads(receipt.read_text()) == expected
     except (OSError, ValueError):
         cached = False
     if not cached:
-        run([ci["verifier"], "--name", image, "--version", version, "--build", build], env=ci_environment(), capture=False, timeout=900)
+        run([ci["verifier"], "--name", image, "--version", version, "--build", build, *runtime_args], env=ci_environment(), capture=False, timeout=900)
         if image_identity(image) != identity:
             raise UpdateError("CI image changed during verification")
         receipt.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -418,6 +445,9 @@ def _xcodes_interactive_attempt(argv, verification, wait_seconds, first_challeng
                 raise UpdateError("xcodes: Apple limited verification attempts")
             if code_submitted:
                 raise UpdateError("xcodes: verification code was rejected")
+            category = xcodes_category(output)
+            if category:
+                raise UpdateError(f"xcodes: {category}")
             raise UpdateError(f"xcodes exited {process.returncode}")
         return "xcodes-complete", challenge_started
     finally:
@@ -534,17 +564,64 @@ def developer_app(developer):
     return Path(developer).parents[1] if developer.endswith(".app/Contents/Developer") else None
 
 
-def activate(version, build):
+def activate(version, build, state_dir=None):
     app = matching_app(version, build)
     if app is None:
         raise UpdateError("approved Xcode is not installed; activation refused")
     # Checked again here: a job may have started during validation.
     if host_is_busy():
         raise UpdateError("Xcode build or runner job is active; activation deferred")
+    previous = run(["/usr/bin/xcode-select", "-p"])
     root_helper("select", app)
     if not report(version, build)["selectedMatches"]:
         raise UpdateError("xcode-select did not select the approved Xcode")
+    if state_dir is not None:
+        record_promotion(state_dir, version, build, previous)
     return "activated"
+
+
+PROMOTION_FILE = "promoted.json"
+
+
+def write_private_json(path, document):
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as output:
+        json.dump(document, output, sort_keys=True)
+        output.write("\n")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def record_promotion(state_dir, version, build, previous):
+    """The start of the migration window; the fleet compares delivery runs against it."""
+    write_private_json(Path(state_dir) / PROMOTION_FILE,
+                       {"version": version, "build": build, "promotedAt": now_iso(), "previous": previous})
+
+
+def promotion(state_dir, version, build):
+    """The promotion record for this exact pin, or None."""
+    try:
+        record = json.loads((Path(state_dir) / PROMOTION_FILE).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or record.get("version") != version or record.get("build") != build \
+            or not isinstance(record.get("promotedAt"), str):
+        return None
+    return record
+
+
+def ensure_promotion_record(state_dir, version, build):
+    # A host that selected the pin before promotion records existed starts its
+    # window when first observed: later than the real switch, so only a
+    # delivery run newer than that can validate it.
+    if promotion(state_dir, version, build) is None:
+        record_promotion(state_dir, version, build, None)
 
 
 def validate(version, build, checks):
@@ -565,6 +642,8 @@ def validate(version, build, checks):
 def reconcile(version, build, checks, phase, stage_root, verification=None, components=(), apple=None, before=None):
     before = before or report(version, build)
     stage(version, build, stage_root, verification, components, apple)
+    if before.get("selectedMatches"):
+        ensure_promotion_record(stage_root, version, build)
     if phase == "stage":
         return "staged"
     if before["selectedMatches"]:
@@ -576,7 +655,7 @@ def reconcile(version, build, checks, phase, stage_root, verification=None, comp
     validate(version, build, checks)
     previous = before["selected"]
     try:
-        activate(version, build)
+        activate(version, build, stage_root)
     except UpdateError:
         # If a switch succeeded but verification failed, restore the prior toolchain.
         if run(["/usr/bin/xcode-select", "-p"]) != previous:
@@ -592,20 +671,26 @@ def version_key(version):
     return tuple(int(part) for part in version.split("."))
 
 
-def prune(version, build, retain, previous=None):
+def prune(version, build, retain, previous=None, window=False):
     """Keep `retain` Xcode bundles: protected ones first, then the newest others.
 
-    Protected: the selected app, the app selected before this reconcile, and
-    the target of an /Applications/Xcode.app symlink.
+    Protected: the selected app, each app in `previous` (the selection before
+    this reconcile, and the one recorded at promotion), and the target of an
+    /Applications/Xcode.app symlink. During the migration window (`window`:
+    promoted but not yet validated) at least two bundles stay, so the previous
+    Xcode survives until delivery is green whatever `retain` says.
     """
     if host_is_busy():
         return []
     current = report(version, build)
     if not current["selectedMatches"]:
         raise UpdateError("approved Xcode is not selected; pruning refused")
+    if window:
+        retain = max(retain, 2)
     protected = {app_path(version), developer_app(current["selected"])}
-    if previous:
-        protected.add(developer_app(previous))
+    for developer in ([previous] if isinstance(previous, str) else list(previous or [])):
+        if developer:
+            protected.add(developer_app(developer))
     plain = APPLICATIONS / "Xcode.app"
     if plain.is_symlink():
         protected.add(plain.resolve())
@@ -628,6 +713,43 @@ def prune(version, build, retain, previous=None):
         root_helper("remove", app)
         removed.append(str(app))
     return removed
+
+
+def in_window(state_dir, version, build):
+    record = promotion(state_dir, version, build)
+    return record is None or not record.get("retiredAt")
+
+
+def image_pruner(pin):
+    ci = pin.ci or {}
+    return ci.get("imagePruner") or str(Path(pin.paths["hostSetup"]) / "ci-vm/prune-images.mjs")
+
+
+def retire(pin, state_dir):
+    """Remove the previous Xcode (and unreferenced CI images) once the fleet has validated the pin."""
+    version, build = pin.version, pin.build
+    if host_is_busy():
+        return "deferred-busy", []
+    current = report(version, build)
+    if not current["selectedMatches"]:
+        raise UpdateError("approved Xcode is not selected; retire refused")
+    record = promotion(state_dir, version, build)
+    if record is None:
+        raise UpdateError("no promotion record for the approved Xcode; retire refused")
+    selected = developer_app(current["selected"])
+    previous = developer_app(record["previous"]) if isinstance(record.get("previous"), str) else None
+    if previous is not None and selected is not None and previous.resolve() == selected.resolve():
+        raise UpdateError("the previous Xcode is the selected one; retire refused")
+    removed = prune(version, build, pin.retain)
+    if pin.role == "ci-image":
+        pruner = image_pruner(pin)
+        if not Path(pruner).is_absolute() or not os.access(pruner, os.X_OK):
+            raise UpdateError("CI image pruner must be an executable absolute path")
+        # The small default environment: deleting local images needs no GitHub
+        # or Apple credentials. Its output is not echoed.
+        run([pruner, "--apply"], timeout=600)
+    write_private_json(Path(state_dir) / PROMOTION_FILE, {**record, "retiredAt": now_iso()})
+    return "retired", removed
 
 
 def check_xcodes(pin):
@@ -737,6 +859,23 @@ def check_ci(pin):
     return True, f"image {ci['image']} for {ci['repository']}"
 
 
+def check_runtimes(pin):
+    wanted = pin.ci["runtimes"]
+    listing = json.loads(run(["/usr/bin/xcrun", "simctl", "runtime", "list", "-j"], timeout=120))
+    if not isinstance(listing, dict):
+        raise UpdateError("simctl runtime list returned no object")
+    present = {entry.get("version") for entry in listing.values()
+               if isinstance(entry, dict) and entry.get("platformIdentifier") == "com.apple.platform.iphonesimulator"
+               and entry.get("state", "Ready") == "Ready"}
+    missing = [runtime for runtime in wanted if runtime not in present]
+    if missing:
+        # The image builder copies the host's runtime disk images into the guest.
+        return False, (f"iOS simulator runtime(s) missing on the host: {', '.join(missing)}. "
+                       "Install with: xcodebuild -downloadPlatform iOS (add -buildVersion <version> for a runtime "
+                       "other than the selected Xcode's)")
+    return True, f"iOS {', '.join(wanted)} simulator runtimes present"
+
+
 def check_runner(pin):
     plist = Path.home() / "Library/LaunchAgents" / f"{pin.runner_label}.plist"
     if not plist.is_file():
@@ -830,15 +969,32 @@ def _check_signing(pin):
 
 def check_device(pin):
     udid = pin.device_udid
-    listing = run(["/usr/bin/xcrun", "devicectl", "list", "devices"], timeout=120)
-    for line in listing.splitlines():
-        match = re.search(re.escape(udid) + r"(?:\s+\(UDID\))?\s+(\S+)", line, re.I)
-        if match:
-            state = match.group(1)
-            if state in ("connected", "available"):
-                return True, f"{udid} is {state}"
-            return False, f"{udid} is {state}; pair and connect the iPhone"
-    return False, f"{udid} is not listed by devicectl; pair and connect the iPhone"
+    # Plain `devicectl list devices` prints CoreDevice identifiers, not UDIDs;
+    # only the JSON output carries hardwareProperties.udid. It goes to a file,
+    # and stdout is noise.
+    with tempfile.TemporaryDirectory(prefix="factory-devicectl-") as temporary:
+        output = Path(temporary) / "devices.json"
+        run(["/usr/bin/xcrun", "devicectl", "list", "devices", "--json-output", str(output)], timeout=120)
+        try:
+            devices = json.loads(output.read_text())["result"]["devices"]
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            raise UpdateError("devicectl JSON output unreadable") from error
+    if not isinstance(devices, list):
+        raise UpdateError("devicectl JSON output unreadable")
+    for device in devices:
+        hardware = device.get("hardwareProperties") if isinstance(device, dict) else None
+        if not isinstance(hardware, dict) or str(hardware.get("udid", "")).lower() != udid.lower():
+            continue
+        connection = device.get("connectionProperties") or {}
+        name = (device.get("deviceProperties") or {}).get("name", "unnamed device")
+        tunnel, pairing = connection.get("tunnelState"), connection.get("pairingState")
+        detail = f"{udid} ({name}, {connection.get('transportType', 'unknown transport')}): pairing {pairing}, tunnel {tunnel}"
+        if tunnel == "connected" and pairing == "paired":
+            return True, detail
+        if pairing == "paired" and tunnel == "disconnected":
+            return False, f"{detail}; paired but not connected: connect and unlock the iPhone"
+        return False, f"{detail}; pair and connect the iPhone"
+    return False, f"{udid} is not paired to this Mac; pair and connect the iPhone"
 
 
 def check_validation(pin):
@@ -858,6 +1014,7 @@ def host_checks(pin, only=None):
         ("verification-provider", check_provider, pin.verification is not None),
         ("paths", check_paths, True),
         ("ci", check_ci, pin.role == "ci-image"),
+        ("runtimes", check_runtimes, pin.role == "ci-image" and "runtimes" in (pin.ci or {})),
         ("runner", check_runner, pin.runner_label is not None),
         ("runner-env", check_runner_env, bool(pin.runner and pin.runner.get("dir") and pin.runner.get("requiredEnv"))),
         ("runner-groups", check_runner_groups, bool(pin.runner and pin.runner.get("organization"))),
@@ -887,7 +1044,7 @@ def preflight(pin):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("auth-check", "auth-login", "status", "check", "stage", "validate", "activate", "reconcile", "image-stage"))
+    parser.add_argument("command", choices=("auth-check", "auth-login", "status", "check", "stage", "validate", "activate", "reconcile", "image-stage", "retire"))
     parser.add_argument("--manifest")
     parser.add_argument("--host")
     parser.add_argument("--state-dir", default=str(Path.home() / ".local/state/morpheus-factory/updates"))
@@ -911,7 +1068,9 @@ def main():
     version, build, checks, phase, verification, components, apple = (
         pin.version, pin.build, pin.checks, pin.phase, pin.verification, pin.components, pin.apple)
     if args.command == "status":
-        print(json.dumps(report(version, build), indent=2))
+        record = promotion(args.state_dir, version, build)
+        print(json.dumps({**report(version, build), "promotedAt": record and record["promotedAt"],
+                          "retiredAt": record and record.get("retiredAt")}, indent=2))
         return 0
     if args.command == "check":
         results = host_checks(pin)
@@ -940,9 +1099,13 @@ def main():
             before = report(version, build)
             result = reconcile(version, build, checks, phase, state_dir, verification, components, apple, before=before)
             if result in ("promoted", "already-current"):
-                extra["removed"] = prune(version, build, pin.retain, before["selected"])
+                record = promotion(state_dir, version, build)
+                extra["removed"] = prune(version, build, pin.retain, [before["selected"], record and record.get("previous")],
+                                         window=in_window(state_dir, version, build))
+        elif args.command == "retire":
+            result, extra["removed"] = retire(pin, state_dir)
         else:
-            result = activate(version, build)
+            result = activate(version, build, state_dir)
         print(json.dumps({"result": result, "host": args.host, "xcode": {"version": version, "build": build}, **extra}))
     return 0
 

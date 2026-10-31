@@ -124,13 +124,19 @@ class ReadHostTests(unittest.TestCase):
             self.assertTrue(config.has_ci)
             self.assertEqual(config.paths, paths)
             self.assertEqual(config.consumer, controller.Consumer("acme/app", "ci/assert.sh", ("ci/*.yml",)))
+            self.assertEqual(config.consumer.delivery_workflow, "ios-delivery.yml")
+            manifest = write_manifest(Path(temp), {"xcode": {"version": "27.2", "build": "27B52"}},
+                                      consumer={"deliveryWorkflow": "deliver.yaml"})
+            self.assertEqual(controller.read_host(manifest, "zoe-mac-mini").consumer.delivery_workflow, "deliver.yaml")
 
     def test_rejects_bad_consumer_and_role(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             xcode = {"xcode": {"version": "27.2", "build": "27B52"}}
             for consumer, message in (({"repository": "evo"}, "owner/name"), ({"assertion": "../x.sh"}, "relative"),
-                                      ({"pinPaths": ["/etc/*.yml"]}, "relative"), ({"pinPaths": []}, "non-empty")):
+                                      ({"pinPaths": ["/etc/*.yml"]}, "relative"), ({"pinPaths": []}, "non-empty"),
+                                      ({"deliveryWorkflow": "../x.yml"}, "deliveryWorkflow"), ({"deliveryWorkflow": "ci"}, "deliveryWorkflow"),
+                                      ({"deliveryWorkflow": ""}, "deliveryWorkflow")):
                 with self.assertRaisesRegex(controller.FleetError, message):
                     controller.read_host(write_manifest(root, xcode, consumer=consumer), "zoe-mac-mini")
             with self.assertRaisesRegex(controller.FleetError, "host role"):
@@ -436,11 +442,18 @@ class ReconcileTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_reconcile(self, entry, *, status, pinned, pr=("https://github.com/darwin-health/evo/pull/7", "open")):
+    def run_reconcile(self, entry, *, status, pinned, pr=("https://github.com/darwin-health/evo/pull/7", "open"), run=None,
+                      retired='{"result": "retired", "removed": ["/Applications/Xcode_26.3.app"]}'):
         manifest = write_manifest(self.root, entry)
         events = []
+
+        def action(factory, creds, manifest, host, name):
+            events.append(name)
+            return "credentials: loaded\n" + retired if name == "retire" else ""
+
         with patch.object(controller, "host_status", side_effect=status if isinstance(status, list) else None, return_value=status), \
-             patch.object(controller, "host_action", side_effect=lambda factory, creds, manifest, host, action: events.append(action)), \
+             patch.object(controller, "host_action", side_effect=action), \
+             patch.object(controller, "latest_delivery_run", side_effect=lambda consumer: (events.append("runs"), run)[1]), \
              patch.object(controller, "sync_host_tools", side_effect=lambda path: events.append("sync-tools")), \
              patch.object(controller, "consumer_has_pin", side_effect=pinned), \
              patch.object(controller, "ensure_consumer_pr", side_effect=lambda *a: (events.append("pr"), pr)[1]), \
@@ -465,10 +478,12 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual((result, events), ("waiting-host-stage", ["stage"]))
 
     def test_ci_host_promotion_order(self):
+        # The delivery run predates the promotion that just happened: keep the previous app.
         result, events = self.run_reconcile({"xcode": {"version": "27.2", "build": "27B52", "phase": "promote"}, "ci": CI},
-                                            status=[{"installedMatches": True, "selectedMatches": False}, {"installedMatches": True, "selectedMatches": True}],
-                                            pinned=[True])
-        self.assertEqual((result, events), ("host-converged", ["sync-tools", "image-stage", "reconcile"]))
+                                            status=[{"installedMatches": True, "selectedMatches": False},
+                                                    {"installedMatches": True, "selectedMatches": True, "promotedAt": AFTER}],
+                                            pinned=[True, True], run=green(BEFORE))
+        self.assertEqual((result, events), (controller.KEPT, ["sync-tools", "image-stage", "reconcile", "runs"]))
 
     def test_phone_gate_skips_tools_and_image(self):
         result, events = self.run_reconcile({"xcode": {"version": "27.2", "build": "27B52"}},
@@ -479,8 +494,10 @@ class ReconcileTests(unittest.TestCase):
     def test_converged_host_never_touches_the_consumer(self):
         # Evo's V2 lane sits on 26.6 on purpose; a host already on the pin must not open PRs over it.
         result, events = self.run_reconcile({"xcode": {"version": "27.2", "build": "27B52", "phase": "promote"}, "ci": CI},
-                                            status={"installedMatches": True, "selectedMatches": True}, pinned=[False])
-        self.assertEqual((result, events), ("host-converged", ["sync-tools", "image-stage"]))
+                                            status={"installedMatches": True, "selectedMatches": True, "promotedAt": BEFORE},
+                                            pinned=[False], run=green(AFTER))
+        # Unpinned consumer main is not validated: nothing retires, no PR opens.
+        self.assertEqual((result, events), (controller.KEPT, ["sync-tools", "image-stage"]))
 
     def test_stage_phase_holds_before_consumer_step(self):
         # pinned=[] means any consumer check raises StopIteration: the hold must not reach it.
@@ -539,9 +556,10 @@ class ReconcileTests(unittest.TestCase):
 
     def test_agent_that_merges_lets_host_promote(self):
         result, events = self.run_reconcile({"xcode": {"version": "27.2", "build": "27B52"}, "ci": CI},
-                                            status=[{"installedMatches": True, "selectedMatches": False}, {"installedMatches": True, "selectedMatches": True}],
-                                            pinned=[False, True])
-        self.assertEqual((result, events), ("host-converged", ["sync-tools", "image-stage", "pr", "agent", "reconcile"]))
+                                            status=[{"installedMatches": True, "selectedMatches": False},
+                                                    {"installedMatches": True, "selectedMatches": True, "promotedAt": AFTER}],
+                                            pinned=[False, True, True])
+        self.assertEqual((result, events), (controller.KEPT, ["sync-tools", "image-stage", "pr", "agent", "reconcile", "runs"]))
 
     def test_reconcile_uses_host_credentials_project_not_consumer_checkout(self):
         manifest = write_manifest(self.root, {"xcode": {"version": "27.2", "build": "27B52"}})
@@ -551,10 +569,112 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(action.call_args.args[1], self.root / "host-credentials")
 
 
+BEFORE = "2026-10-30T20:00:00Z"
+AFTER = "2026-10-30T21:00:00+00:00"
+LATER = "2026-10-30T22:15:00Z"
+
+
+def green(created_at, conclusion="success"):
+    return {"createdAt": created_at, "url": "https://github.com/darwin-health/evo/actions/runs/1", "conclusion": conclusion}
+
+
+class RetirementGateTests(unittest.TestCase):
+    """The previous Xcode goes only when delivery has validated the pin; unknown keeps it."""
+
+    setUp, tearDown, run_reconcile = ReconcileTests.setUp, ReconcileTests.tearDown, ReconcileTests.run_reconcile
+
+    CONVERGED = {"installedMatches": True, "selectedMatches": True, "promotedAt": AFTER}
+
+    def gate(self, entry=None, status=None, run=None, pinned=(True,), **kwargs):
+        entry = entry or {"xcode": {"version": "27.2", "build": "27B52"}, "ci": CI}
+        return self.run_reconcile(entry, status=status or self.CONVERGED, pinned=list(pinned), run=run, **kwargs)
+
+    def test_run_before_promotion_keeps_the_previous_xcode(self):
+        result, events = self.gate(run=green(BEFORE))
+        self.assertEqual(result, controller.KEPT)
+        self.assertNotIn("retire", events)
+
+    def test_green_run_after_promotion_retires(self):
+        result, events = self.gate(run=green(LATER))
+        self.assertEqual(result, "host-converged (retired: /Applications/Xcode_26.3.app)")
+        self.assertEqual(events, ["sync-tools", "image-stage", "runs", "retire"])
+
+    def test_phone_gate_uses_the_same_consumer_evidence(self):
+        result, events = self.gate(entry={"xcode": {"version": "27.2", "build": "27B52"}}, run=green(LATER))
+        self.assertEqual((result, events), ("host-converged (retired: /Applications/Xcode_26.3.app)", ["runs", "retire"]))
+
+    def test_no_run_keeps(self):
+        result, events = self.gate(run=None)
+        self.assertEqual(result, controller.KEPT)
+        self.assertNotIn("retire", events)
+
+    def test_newest_completed_run_failing_keeps(self):
+        for conclusion in ("failure", "cancelled"):
+            result, events = self.gate(run=green(LATER, conclusion))
+            self.assertEqual(result, controller.KEPT)
+            self.assertNotIn("retire", events)
+
+    def test_equal_or_unreadable_times_keep(self):
+        for created in (AFTER, "2026-10-30T21:00:00Z", "yesterday", None, "2026-10-30T22:15:00"):
+            self.assertNotIn("retire", self.gate(run=green(created))[1])
+
+    def test_gh_failure_keeps_and_never_retires(self):
+        consumer = controller.Consumer()
+        with patch.object(controller, "command", side_effect=controller.FleetError("command failed (1): gh run")):
+            self.assertIsNone(controller.latest_delivery_run(consumer))
+        with patch.object(controller, "command", return_value="not json"):
+            self.assertIsNone(controller.latest_delivery_run(consumer))
+        with patch.object(controller, "command", return_value="[]"):
+            self.assertIsNone(controller.latest_delivery_run(consumer))
+        with patch.object(controller, "command", side_effect=controller.FleetError("gh failed")), \
+             patch.object(controller, "consumer_has_pin", return_value=True), \
+             patch.object(controller, "host_action", side_effect=AssertionError("must not retire")):
+            config = controller.HostConfig(PIN, "phone-gate", False)
+            self.assertEqual(controller.retire_if_validated(config, self.root, self.root, self.root, "h", self.root, self.CONVERGED),
+                             controller.KEPT)
+
+    def test_repository_manifest_names_the_delivery_workflow(self):
+        manifest = Path(__file__).resolve().parents[1] / "worker/updates.json"
+        self.assertEqual(controller.read_host(manifest, "zoe-mac-mini").consumer.delivery_workflow, "ios-delivery.yml")
+
+    def test_gh_reads_the_newest_completed_delivery_run_on_main(self):
+        consumer = controller.Consumer(delivery_workflow="deliver.yml")
+        with patch.object(controller, "command", return_value=json.dumps([green(LATER)])) as command:
+            self.assertEqual(controller.latest_delivery_run(consumer), green(LATER))
+        self.assertEqual(command.call_args.args[0], ["gh", "run", "list", "--repo", "darwin-health/evo", "--workflow", "deliver.yml",
+                                                     "--branch", "main", "--status", "completed", "--limit", "1",
+                                                     "--json", "createdAt,url,conclusion"])
+
+    def test_consumer_check_failure_keeps(self):
+        with patch.object(controller, "consumer_has_pin", side_effect=controller.FleetError("fetch failed")), \
+             patch.object(controller, "host_action", side_effect=AssertionError("must not act")):
+            config = controller.HostConfig(PIN, "phone-gate", False)
+            self.assertEqual(controller.retire_if_validated(config, self.root, self.root, self.root, "h", self.root, self.CONVERGED),
+                             controller.KEPT)
+
+    def test_missing_promotion_record_is_recorded_not_retired(self):
+        status = {"installedMatches": True, "selectedMatches": True, "promotedAt": None}
+        result, events = self.gate(status=status, run=green(LATER))
+        self.assertEqual((result, events), (controller.KEPT, ["sync-tools", "image-stage", "reconcile"]))
+
+    def test_retired_host_does_nothing_more(self):
+        status = {**self.CONVERGED, "retiredAt": LATER}
+        result, events = self.gate(status=status, pinned=(), run=green(LATER))
+        self.assertEqual((result, events), ("host-converged", ["sync-tools", "image-stage"]))
+
+    def test_busy_host_defers_retire(self):
+        result, _ = self.gate(run=green(LATER), retired='{"result": "deferred-busy", "removed": []}')
+        self.assertEqual(result, "host-converged (retire deferred: host busy)")
+
+    def test_unreadable_retire_output_fails_the_tick(self):
+        with self.assertRaisesRegex(controller.FleetError, "invalid host retire result"):
+            self.gate(run=green(LATER), retired="not json")
+
+
 class HostAndStateTests(unittest.TestCase):
     def test_host_action_does_not_inherit_github_token(self):
         with patch.dict(os.environ, {"GH_TOKEN": "secret", "FACTORY_GH_TOKEN": "secret", "GIT_ASKPASS": "/askpass"}), patch.object(controller, "command") as command:
-            for action in ("stage", "reconcile"):
+            for action in ("stage", "reconcile", "retire"):
                 controller.host_action(Path("/factory"), Path("/host-credentials"), Path("/factory/worker/updates.json"), "zoe-mac-mini", action)
                 env = command.call_args.kwargs["env"]
                 self.assertNotIn("GH_TOKEN", env)

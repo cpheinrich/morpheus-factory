@@ -40,11 +40,13 @@ All fields beyond `xcode` and `validation` are optional; `schemaVersion` stays 1
 | `xcode.version`, `xcode.build` | exact pin | required |
 | `xcode.components` | components such as `MetalToolchain`, re-requested every run | `[]` |
 | `xcode.phase` | `stage` holds the host after installing; `promote` validates and switches | absent means `promote` |
-| `xcode.retain` | Xcode bundles to keep in total, including the selected one (integer ≥ 1) | `2` |
+| `xcode.retain` | Xcode bundles to keep in total once the pin is validated, including the selected one (integer ≥ 1); see [Retention](#retention-one-xcode-per-host) | `1` |
 | `paths.factory`, `paths.consumer`, `paths.hostSetup`, `paths.credentialsProject` | absolute directories on this host | Factory checkout, `~/code/evo`, `~/code/agent-host-setup` (ci-image only), the consumer |
 | `apple.idVar`, `apple.passwordVar` | **names** of the environment variables holding the Apple Account login | `APPLE_ID`, `APPLE_ID_PASSWORD` |
 | `verification` | `purpose` and `account` for the SMS code provider | none |
 | `ci` | image builder, verifier, activator, repository, image and label (ci-image only) | none |
+| `ci.runtimes` | exact iOS simulator runtime versions the image carries, e.g. `["26.5", "27.2"]`; non-empty and unique when present | none (the builder's default) |
+| `ci.imagePruner` | absolute path of the CI image pruner `retire` runs | `<paths.hostSetup>/ci-vm/prune-images.mjs` |
 | `runner.label` | the GitHub Actions runner LaunchAgent label to check | none |
 | `runner.dir` | absolute runner directory | none |
 | `runner.requiredEnv` | variable names the runner's `.env` must define | `[]` |
@@ -81,6 +83,11 @@ check fails. A check that cannot determine its answer reports `ok: false` with
    `FACTORY_VERIFICATION_CODE_URL` is `https`.
 6. `paths` — each directory exists; `factory` and `consumer` are git checkouts.
 7. `ci` (ci-image) — builder, verifier, activator and `tart` are executable.
+   `runtimes` (ci-image with `ci.runtimes`) — `xcrun simctl runtime list -j`
+   shows every listed iOS version as a `Ready` iOS simulator runtime on the host,
+   because the image builder copies the host's runtime disk images into the
+   guest. A missing one fails with the remedy `xcodebuild -downloadPlatform iOS`
+   (add `-buildVersion <version>` for a runtime other than the selected Xcode's).
 8. `runner` (with `runner.label`) — `~/Library/LaunchAgents/<label>.plist` exists
    and has no true `SessionCreate`. With `SessionCreate` the runner gets a new
    security session in which the login keychain is locked, and `codesign` fails
@@ -101,9 +108,13 @@ check fails. A check that cannot determine its answer reports `ok: false` with
     parenthesised suffix of an Apple Development name is a personal id, not the
     team.) Two matching identities make `CODE_SIGN_IDENTITY="Apple Development"`
     ambiguous; the detail lists both SHA-1 fingerprints so one can be removed.
-12. `device` (with `device.udid`) — `xcrun devicectl list devices` lists the UDID
-    as `connected` or `available`; `unavailable`, `connecting`, absent or a command
-    error fails.
+12. `device` (with `device.udid`) — `xcrun devicectl list devices --json-output <file>`
+    lists a device whose `hardwareProperties.udid` is the UDID (case-insensitive)
+    with `pairingState` `paired` and `tunnelState` `connected`. The plain listing
+    prints CoreDevice identifiers, not UDIDs, so only the JSON is read. The detail
+    names the device, transport and states; an absent UDID is "not paired to this
+    Mac", a disconnected tunnel is "paired but not connected", and a command or
+    JSON failure is "could not be determined".
 13. `validation` — each validation executable exists and is executable.
 
 ## Preflight
@@ -278,15 +289,57 @@ helper; a previous selection outside an Xcode app (such as the Command Line
 Tools) cannot be restored and is reported. An Xcode update can require a new simulator runtime; the
 validation command must cover the consumer's actual build destination.
 
-**Pruning.** After a successful promotion, and on every `already-current`
-reconcile on an idle host, the controller keeps `xcode.retain` Xcode bundles in
-total (default 2). It always keeps the selected app, the app selected before this
-reconcile (the rollback), and the target of an `/Applications/Xcode.app` symlink;
-remaining slots go to the newest other `/Applications/Xcode_<version>.app`
-bundles, compared numerically. It removes the rest with the helper's `remove`,
-listing them under `removed` in the result. It only considers
-`Xcode_<version>.app` bundles whose `xcodebuild -version` it can read, and never
-removes `/Applications/Xcode.app`. Simulator runtimes are never deleted.
+## Retention: one Xcode per host
+
+In steady state a host keeps **one** Xcode, the pin (`xcode.retain` defaults to
+1). During a migration it keeps the previous one too, until the new pin is
+*validated*; then the previous app goes.
+
+**Promotion record.** When `activate` switches the selection it writes
+`<state-dir>/promoted.json` (mode 0600, atomic):
+`{"version", "build", "promotedAt": <ISO time>, "previous": <developer dir selected before>}`.
+`status` reports `promotedAt` and `retiredAt` for the current pin (`null` when
+absent or for another pin). A host that already selected the pin before records
+existed gets one on its next `reconcile`, timed when first seen and with
+`previous: null`, so only a later delivery run can validate it.
+
+**Migration window.** Until `retire` has run for the pin, pruning after a
+promotion or on an `already-current` reconcile keeps at least two bundles,
+whatever `retain` says: the selected app, the app selected before this reconcile
+and the recorded `previous` are protected, and with no known previous the newest
+other bundle stays. Pruning always keeps the selected app and the target of an
+`/Applications/Xcode.app` symlink, fills remaining slots with the newest other
+`/Applications/Xcode_<version>.app` bundles (compared numerically), and removes
+the rest with the helper's `remove`, listing them under `removed`. It only
+considers bundles whose `xcodebuild -version` it can read, never removes
+`/Applications/Xcode.app`, and does nothing on a busy host.
+
+**Validated** means three facts, judged by the [fleet coordinator](../fleet/README.md#retiring-the-previous-xcode):
+the host selects the pin, the consumer's merged main carries the pin, and the
+newest completed run of the consumer's delivery workflow on main started after
+`promotedAt` and succeeded.
+
+**`retire`.**
+
+```sh
+morpheus credentials run -- python3 worker/update_controller.py retire --host <host> --manifest worker/updates.json
+```
+
+returns `{"result": "retired", "removed": [...]}`. It returns `deferred-busy`
+and removes nothing while `xcodebuild`, `swift-frontend` or `Runner.Worker` is
+running; refuses when the pin is not selected, when there is no promotion record
+for the pin, or when the recorded previous app is the selected one. It prunes to
+`retain` with no migration-window protection. On ci-image hosts it then runs
+`<ci.imagePruner> --apply` (agent-host-setup's `ci-vm/prune-images.mjs`), which
+deletes local `ci-xcode-*` Tart images that no pool in `~/ci-vm/config.json`
+references and that are not running; the pruner gets the small default
+environment, no GitHub or Apple credentials, and its output is not echoed. Last,
+it stamps `retiredAt` into the record, which ends the window; the fleet stops
+calling it for that pin.
+
+**Simulator runtimes are not deleted by Factory.** A host keeps what
+`ci.runtimes` lists (plus whatever else is installed); retirement removes Xcode
+apps and unreferenced CI images only.
 
 ## CI images (ci-image hosts)
 
@@ -299,7 +352,16 @@ then activates that repository's version-specific image pool. A 0600 receipt in
 `~/.local/state/morpheus-factory/updates/ci-images/` binds this proof to the
 Tart image's disk/config/NVRAM file identities; ordinary reconciles use the
 receipt and a cheap sealed-image check. Replacement or mutation forces a new
-guest verification. Other repositories retain their current image and cache.
+guest verification. Every repository on the host uses that one image: the
+activator makes it the host-wide default, so after activation the previous
+`ci-xcode-*` image is unreferenced and `retire` removes it.
+
+With `ci.runtimes`, `image-stage` passes `--runtime <version>` for each listed
+runtime, in order, to both the builder and the verifier, and the receipt records
+the list: changing it forces a fresh guest verification on the next tick. An
+image built before a runtime was added fails that verification; delete it
+(`tart delete ci-xcode-<version>`) so the next tick rebuilds it. The image name
+stays `ci-xcode-<version>`.
 The consumer workflow still moves by reviewed PR, and the host pin moves to
 `promote` only after the consumer's CI run passes.
 
