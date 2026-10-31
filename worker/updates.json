@@ -14,7 +14,7 @@
   "hosts": {
     "zoe-mac-mini": {
       "role": "ci-image",
-      "hold": "Xcode 27.2 rollout is on hold (Chris, 2026-10-30): Evo's full UI suite on 27.2 had 29 first-pass failures and ran over 3 h, so Evo returns to 26.6 everywhere. Remove this hold to resume.",
+      "hold": "Factory tick paused 2026-10-30: Xcode 27.2 (27B52) remains Evo's pin and the Mini's selected Xcode; the 27.2 UI-suite failures were traced to Evo source changes, not the toolchain. Resume (remove this hold) after `install_updates.py --check` passes on the host, which needs the root helper from #10 installed there.",
       "xcode": {
         "version": "27.2",
         "build": "27B52",
@@ -53,7 +53,7 @@
     },
     "christophers-macbook-pro": {
       "role": "phone-gate",
-      "hold": "Xcode 27.2 rollout is on hold (Chris, 2026-10-30): Evo's full UI suite on 27.2 had 29 first-pass failures and ran over 3 h, so Evo returns to 26.6 everywhere. Remove this hold to resume.",
+      "hold": "Factory tick paused 2026-10-30: Xcode 27.2 (27B52) remains Evo's pin and the Mini's selected Xcode; the 27.2 UI-suite failures were traced to Evo source changes, not the toolchain. Resume (remove this hold) after `install_updates.py --check` passes on the host, which needs the root helper from #10 installed there.",
       "xcode": {
         "version": "27.2",
         "build": "27B52",
@@ -98,7 +98,7 @@
     },
     "christophers-macbook-air": {
       "role": "phone-gate",
-      "hold": "Xcode 27.2 rollout is on hold (Chris, 2026-10-30): Evo's full UI suite on 27.2 had 29 first-pass failures and ran over 3 h, so Evo returns to 26.6 everywhere. Remove this hold to resume.",
+      "hold": "Factory tick paused 2026-10-30: Xcode 27.2 (27B52) remains Evo's pin and the Mini's selected Xcode; the 27.2 UI-suite failures were traced to Evo source changes, not the toolchain. Resume (remove this hold) after `install_updates.py --check` passes on the host, which needs the root helper from #10 installed there.",
       "xcode": {
         "version": "27.2",
         "build": "27B52",

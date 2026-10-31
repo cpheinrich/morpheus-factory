@@ -20,8 +20,9 @@ a `ci-image` role without `ci` (or the reverse) is refused.
 
 A host entry with `"hold": "<reason>"` makes the tick return `held: <reason>`
 before any action: no staging, no image activation, no consumer PR, no switch.
-It is the reviewed way to pause a rollout (the 27.2 rollout is held since
-2026-10-30 while Evo returns to 26.6). `status` shows the hold.
+It is the reviewed way to pause a rollout. Since 2026-10-30 every host is held
+while the root helper from #10 is installed on it; 27.2 stays the pin. `status`
+shows the hold.
 
 ## Order
 
