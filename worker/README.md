@@ -9,7 +9,7 @@ rerunnable, and `--check` reports local readiness without changing the host.
 | --- | --- |
 | `prerequisites.sh` | Check macOS, login user and Apple command-line tools; `--check` also reports whether `sudo -n` works, which Xcode staging and activation need for their exact commands (the operator adds that sudoers rule once; see `docs/host-updates.md`). |
 | `apps.sh` | Remove iMovie, GarageBand, Keynote, Pages and Numbers after verifying their Apple bundle IDs; remove orphaned GarageBand audio content when no compatible app remains. |
-| `tools.sh` | Install Git, Node, pnpm, gh and `xcodes` through Homebrew when missing (`xcodes` comes from the `xcodesorg/made` tap, not homebrew-core); require `python3` from the command-line tools. |
+| `tools.sh` | Install Git, Node, pnpm and gh through Homebrew when missing; install `xcodes` 2.1.0 to `~/.local/bin` from the publisher's checksummed release binary (the Homebrew tap builds from source and fails on macOS 27); require `python3` from the command-line tools. |
 | `source.sh` | Clone Morpheus without resetting an existing checkout. |
 | `morpheus.sh` | Install the copied Morpheus CLI when missing; the watchdog uses its guarded worktree cleanup. |
 | `spotlight.sh` | Exclude existing source, worktree, VM and cache roots from Spotlight indexing. |

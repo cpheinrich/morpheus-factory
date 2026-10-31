@@ -240,3 +240,21 @@ recorded with its actual output.
   (proven on the Pro on 2026-10-30). Factory writes its own plist without it.
   Evo's restricted device runner keeps its installer in agent-host-setup; Factory
   only checks its plist.
+- *`xcodes` is installed from its pinned, checksummed release binary.* The
+  Homebrew tap compiles it from source and fails on macOS 27 (observed on the
+  Air; XcodesOrg/homebrew-made#4). One audited version and checksum in
+  `worker/setup/tools.sh`, the same shape as asccli in Morpheus.
+
+**Air run, 2026-10-30.** `worker/setup.sh` completed (xcodes 2.1.0 installed;
+GarageBand and iMovie left in place because `sudo -n` is unavailable);
+`update_controller.py check --host christophers-macbook-air` and
+`install_updates.py --check` reported exactly the three real gaps (passwordless
+sudo, Apple developer credentials, the phone disconnected) and passed xcodes,
+disk, paths, the single TAML3DQJTR signing identity and the validation command;
+`fleet/controller.py status` read `consumerPinned: true` from live Evo main;
+`worker/runner.sh install` registered `factory-air-test` on darwin-health/evo
+with only the `factory-air` label, GitHub listed it online, the plist had no
+`SessionCreate`, and `remove` deregistered it. Evo's signed `EvoStagingDeviceGate`
+build-for-testing passed on the Air with the connected iPhone 17 Pro Max
+(7 min 51 s); a second run after the phone disconnected failed on the missing
+destination, which is what the `device` check exists to catch early.
