@@ -65,7 +65,11 @@ if [[ "$verb" == install ]]; then
   [[ -d "$quarantined" && ! -L "$quarantined" ]] || refuse "clone of $src is not a directory; inspect and sudo rm -rf $quarantined"
   trap 'echo "morpheus-factory-xcode: install failed; the bundle is left in $quarantined (remove with sudo rm -rf $quarantined)" >&2' ERR
   "$CHOWN" -R root:wheel "$quarantined"
+  # Apple ships Xcode world-readable (755/644). The clone can arrive with the
+  # worker's private modes (the Pro, 2026-10-31: a 700 bundle nobody but root
+  # could open), so normalise to readable-and-unwritable before verifying.
   "$CHMOD" -R go-w "$quarantined"
+  "$CHMOD" -R go+rX "$quarantined"
   "$CHMOD" -R -N "$quarantined"
   "$CODESIGN" --verify --deep --strict -R="$REQUIREMENT" "$quarantined" >/dev/null 2>&1 || refuse "codesign rejected $quarantined as Apple's Xcode; it is left there (sudo rm -rf $quarantined)"
   "$SPCTL" --assess --type execute "$quarantined" >/dev/null 2>&1 || refuse "spctl rejected $quarantined; it is left there (sudo rm -rf $quarantined)"

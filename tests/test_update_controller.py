@@ -84,10 +84,35 @@ class UpdateControllerTests(unittest.TestCase):
         validate.assert_not_called()
         activate.assert_not_called()
 
+    def test_stage_defers_while_ci_is_busy(self):
+        # The Pro, 2026-10-31: first launch rewrote shared frameworks under a running CD phone gate.
+        with patch.object(controller, "matching_app", return_value=None), patch.object(controller, "host_is_busy", return_value=True), \
+             patch.object(controller, "run_xcodes") as download:
+            self.assertEqual(controller.stage("27.2", "27B52", Path("/tmp/state")), "deferred-busy")
+        download.assert_not_called()
+        app = Path("/Applications/Xcode_27.2.app")
+        with patch.object(controller, "matching_app", return_value=app), patch.object(controller, "host_is_busy", return_value=True), \
+             patch.object(controller, "run") as child:
+            self.assertEqual(controller.stage("27.2", "27B52", Path("/tmp/state"), components=["MetalToolchain"]), "deferred-busy")
+        child.assert_not_called()
+
+    def test_wait_until_idle_polls_then_gives_up(self):
+        clock = [0.0]
+        with patch.object(controller, "host_is_busy", side_effect=[True, True, False]), \
+             patch.object(controller.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(controller.time, "sleep", side_effect=lambda s: clock.__setitem__(0, clock[0] + s)) as sleep:
+            self.assertTrue(controller.wait_until_idle(timeout=600, poll=30))
+        self.assertEqual(sleep.call_count, 2)
+        clock[0] = 0.0
+        with patch.object(controller, "host_is_busy", return_value=True), \
+             patch.object(controller.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(controller.time, "sleep", side_effect=lambda s: clock.__setitem__(0, clock[0] + s)):
+            self.assertFalse(controller.wait_until_idle(timeout=90, poll=30))
+
     def test_already_installed_xcode_still_repairs_declared_components(self):
         app = Path("/Applications/Xcode_27.2.app")
         with patch.object(controller, "matching_app", return_value=app), \
-             patch.object(controller, "ensure_components") as ensure:
+             patch.object(controller, "ensure_components", return_value=True) as ensure:
             result = controller.stage("27.2", "27B52", Path("/tmp/state"), components=["MetalToolchain"])
         self.assertEqual(result, "already-installed")
         ensure.assert_called_once_with(app, ["MetalToolchain"])
@@ -161,14 +186,35 @@ class UpdateControllerTests(unittest.TestCase):
                 controller.reconcile("27.2", "27B52", [], "promote", Path("/tmp/state"))
 
     def test_busy_host_defers_before_the_validation_build(self):
+        clock = [0.0]
         with patch.object(controller, "report", return_value={"selected": "/Applications/Xcode.app/Contents/Developer", "selectedMatches": False}), \
              patch.object(controller, "stage"), patch.object(controller, "validate") as validate, \
              patch.object(controller, "activate") as activate, \
+             patch.object(controller.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(controller.time, "sleep", side_effect=lambda s: clock.__setitem__(0, clock[0] + s)) as sleep, \
              patch.object(controller, "run", return_value="/sbin/launchd\n/Users/chris/actions-runner/bin/Runner.Worker\n"):
             result = controller.reconcile("27.2", "27B52", [], "promote", Path("/tmp/state"))
         self.assertEqual(result, "deferred-busy")
+        # A live job is waited out only for the settle window, never for the full idle wait.
+        self.assertEqual(sleep.call_count, controller.SETTLE_SECONDS // controller.SETTLE_POLL_SECONDS)
         validate.assert_not_called()
         activate.assert_not_called()
+
+    def test_exiting_component_helpers_settle_before_the_validation_build(self):
+        # `xcodebuild -downloadComponent` leaves helper xcodebuild processes alive
+        # for a moment after it returns (the Pro, 2026-10-31): two ticks deferred
+        # for nothing. A host that is idle again within the settle window promotes.
+        helpers = "/sbin/launchd\n/Applications/Xcode_27.2.app/Contents/Developer/usr/bin/xcodebuild\n"
+        listings = iter([helpers, helpers, "/sbin/launchd\n"])
+        with patch.object(controller, "report", return_value={"selected": "/Applications/Xcode.app/Contents/Developer", "selectedMatches": False}), \
+             patch.object(controller, "stage"), patch.object(controller, "validate") as validate, \
+             patch.object(controller, "activate") as activate, \
+             patch.object(controller.time, "monotonic", return_value=0.0), patch.object(controller.time, "sleep"), \
+             patch.object(controller, "run", side_effect=lambda argv, **kwargs: next(listings)):
+            result = controller.reconcile("27.2", "27B52", [], "promote", Path("/tmp/state"))
+        self.assertEqual(result, "promoted")
+        validate.assert_called_once()
+        activate.assert_called_once()
 
     def test_stage_installs_through_the_helper_and_never_moves_itself(self):
         temporary = tempfile.TemporaryDirectory()
@@ -192,6 +238,7 @@ class UpdateControllerTests(unittest.TestCase):
 
         identity = lambda app: ("27.2", "27B52") if app.exists() else None
         with patch.object(controller, "APPLICATIONS", applications), patch.object(controller, "matching_app", return_value=None), \
+             patch.object(controller.os, "access", return_value=True), \
              patch.object(controller, "installed_build", side_effect=identity), patch.object(controller, "run", side_effect=command), \
              patch.object(controller, "run_xcodes", side_effect=download), patch.object(controller, "ensure_components") as components, \
              patch.object(controller.shutil, "which", return_value="/opt/homebrew/bin/xcodes"), \
@@ -207,6 +254,19 @@ class UpdateControllerTests(unittest.TestCase):
         # The helper clones and leaves the source; the temporary directory removes it.
         self.assertFalse(Path(helper[0][4]).exists())
 
+    def test_unreadable_install_is_named_not_blamed_on_identity(self):
+        # The Pro, 2026-10-31: the helper left /Applications/Xcode_27.2.app mode 700 root, so the
+        # user could not run its xcodebuild and the old message blamed the identity.
+        with tempfile.TemporaryDirectory() as temp:
+            app = Path(temp) / "Xcode_27.2.app"
+            binary = app / "Contents/Developer/usr/bin/xcodebuild"
+            with self.assertRaisesRegex(controller.UpdateError, "not readable by this user"):
+                controller.require_readable(app)
+            binary.parent.mkdir(parents=True)
+            binary.write_text("#!/bin/sh\n")
+            binary.chmod(0o755)
+            controller.require_readable(app)
+
     def test_stage_refuses_when_helper_install_leaves_wrong_identity(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -221,6 +281,7 @@ class UpdateControllerTests(unittest.TestCase):
             return ("27.2", "27B52") if app.name == "Xcode.app" else None
 
         with patch.object(controller, "APPLICATIONS", root), patch.object(controller, "matching_app", return_value=None), \
+             patch.object(controller.os, "access", return_value=True), \
              patch.object(controller, "installed_build", side_effect=identity), patch.object(controller, "run", side_effect=command), \
              patch.object(controller, "run_xcodes", side_effect=lambda argv, *a: (Path(argv[-1]) / "x.xip").write_text("")), \
              patch.object(controller, "ensure_components") as components, \
@@ -286,7 +347,7 @@ class UpdateControllerTests(unittest.TestCase):
             "FACTORY_VERIFICATION_CODE_TOKEN": "broker-secret",
             "ZOE_APPLE_ID_PASSWORD": "apple-secret",
             "ASC_ISSUER_ID": "other-secret",
-        }), patch.object(controller.subprocess, "run", return_value=Result()) as child:
+        }), patch.object(controller.subprocess, "run", return_value=Result()) as child, patch.object(controller.time, "time", return_value=100.0):
             self.assertEqual(controller.request_verification_code(verification, 100.0, 120, 6), "123456")
         sent = json.loads(child.call_args.kwargs["input"])
         self.assertEqual(sent, {"purpose": "apple-developer", "account": "zoe-apple-developer", "challengeStartedAt": 100.0, "timeoutSeconds": 120})
@@ -294,6 +355,37 @@ class UpdateControllerTests(unittest.TestCase):
         self.assertEqual(passed["FACTORY_VERIFICATION_CODE_TOKEN"], "broker-secret")
         self.assertNotIn("ZOE_APPLE_ID_PASSWORD", passed)
         self.assertNotIn("ASC_ISSUER_ID", passed)
+
+    def test_one_sms_per_wait_window_even_when_the_provider_answers_at_once(self):
+        # The Pro, 2026-10-31: an unauthorized caller made the provider exit 75 immediately and the
+        # controller asked Apple for a new code three times within a minute.
+        clock = [100.0]
+        def now(): return clock[0]
+        def sleep(seconds): clock[0] += seconds
+        attempts = []
+        def provider(argv, **kwargs):
+            attempts.append(json.loads(kwargs["input"])["timeoutSeconds"])
+            return SimpleNamespace(returncode=75, stdout="", stderr="verification code unavailable")
+        verification = {"purpose": "p", "account": "a"}
+        with patch.dict(os.environ, {"FACTORY_VERIFICATION_CODE_COMMAND": "/usr/bin/true"}), \
+             patch.object(controller.subprocess, "run", side_effect=provider), \
+             patch.object(controller.time, "time", side_effect=now), patch.object(controller.time, "sleep", side_effect=sleep):
+            with self.assertRaises(controller.CodeTimeout):
+                controller.request_verification_code(verification, 100.0, 120, 6)
+        # Re-asked every 10 s across the whole 120 s window; the window itself never shortened below the deadline.
+        self.assertGreaterEqual(len(attempts), 12)
+        self.assertEqual(clock[0], 220.0)
+        self.assertEqual(attempts[0], 120)
+
+    def test_provider_refusal_stops_without_a_resend(self):
+        verification = {"purpose": "p", "account": "a"}
+        refused = SimpleNamespace(returncode=78, stdout="", stderr="refused")
+        with patch.dict(os.environ, {"FACTORY_VERIFICATION_CODE_COMMAND": "/usr/bin/true"}), \
+             patch.object(controller.subprocess, "run", return_value=refused) as child, \
+             patch.object(controller.time, "time", return_value=100.0):
+            with self.assertRaisesRegex(controller.UpdateError, "refused this host"):
+                controller.request_verification_code(verification, 100.0, 120, 6)
+        self.assertEqual(child.call_count, 1)
 
     def test_late_code_remains_eligible_after_sms_resend(self):
         temporary = tempfile.TemporaryDirectory()
@@ -374,6 +466,74 @@ class XcodesErrorTests(unittest.TestCase):
         self.assertNotIn("secret-ish", str(caught.exception))
 
 
+FAKE_XCODES = r"""
+import sys, termios, time
+def hidden_readline(prompt):
+    # readpassphrase(3): print the prompt, then TCSAFLUSH the terminal (dropping queued input), then read.
+    sys.stdout.write(prompt); sys.stdout.flush()
+    time.sleep(0.3)
+    attrs = termios.tcgetattr(0); attrs[3] &= ~termios.ECHO
+    termios.tcsetattr(0, termios.TCSAFLUSH, attrs)
+    line = sys.stdin.readline().strip()
+    attrs[3] |= termios.ECHO; termios.tcsetattr(0, termios.TCSANOW, attrs)
+    return line
+print("Two-factor authentication is enabled for this account.\n")
+print('Enter "sms" without quotes to exit this prompt and choose a phone number to send an SMS security code to.')
+if hidden_readline("Enter the 6 digit code from one of your trusted devices:") != "sms": sys.exit(3)
+print("Select a trusted phone number to receive a code via SMS:"); print("1: +1 (•••) •••-••12"); sys.stdout.flush()
+if sys.stdin.readline().strip() != "1": sys.exit(4)
+if hidden_readline("Enter the 6 digit code sent to +1 (•••) •••-••12:") != "123456": sys.exit(5)
+print("downloaded"); sys.exit(0)
+"""
+
+
+class HiddenPromptTests(unittest.TestCase):
+    """xcodes reads 2FA answers with readpassphrase, whose TCSAFLUSH drops input queued before it runs."""
+
+    def test_full_sms_flow_against_a_readpassphrase_like_child(self):
+        with patch.object(controller, "xcodes_environment", return_value={"PATH": os.environ.get("PATH", "")}), \
+             patch.object(controller, "request_verification_code", return_value="123456"), \
+             patch.dict(os.environ, {"FACTORY_VERIFICATION_CODE_COMMAND": "/usr/bin/true"}):
+            result, started = controller._xcodes_interactive_attempt([sys.executable, "-c", FAKE_XCODES], {"purpose": "p", "account": "a"}, 5, None)
+        self.assertEqual(result, "xcodes-complete")
+        self.assertIsNotNone(started)
+
+    def test_immediate_write_is_lost_but_waiting_for_echo_off_is_not(self):
+        import pty as _pty, termios as _termios
+        child = r"""
+import sys, termios, time
+sys.stdout.write("prompt:"); sys.stdout.flush(); time.sleep(0.3)
+a = termios.tcgetattr(0); a[3] &= ~termios.ECHO; termios.tcsetattr(0, termios.TCSAFLUSH, a)
+sys.stdout.write("got=" + sys.stdin.readline().strip() + "\n"); sys.stdout.flush()
+"""
+        def run(answer):
+            master, slave = _pty.openpty()
+            process = controller.subprocess.Popen([sys.executable, "-c", child], stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+            os.close(slave)
+            out = b""
+            deadline = controller.time.monotonic() + 5
+            answered = False
+            while controller.time.monotonic() < deadline:
+                ready, _, _ = controller.select.select([master], [], [], 0.1)
+                if ready:
+                    try:
+                        chunk = os.read(master, 4096)
+                    except OSError:
+                        break
+                    out += chunk
+                    if b"prompt:" in out and not answered:
+                        answer(master)
+                        answered = True
+                if b"got=" in out or (process.poll() is not None and not ready):
+                    break
+            process.kill(); process.wait(); os.close(master)
+            return out
+        lost = run(lambda master: os.write(master, b"sms\n"))
+        self.assertNotIn(b"got=sms", lost, "the immediate write should have been flushed by TCSAFLUSH")
+        kept = run(lambda master: controller._answer_hidden_prompt(master, b"sms\n"))
+        self.assertIn(b"got=sms", kept)
+
+
 class ManifestFieldTests(unittest.TestCase):
     def host(self, **fields):
         temporary = tempfile.TemporaryDirectory()
@@ -436,15 +596,13 @@ class ManifestFieldTests(unittest.TestCase):
         self.assertEqual((zoe.role, zoe.phase, zoe.apple["idVar"]), ("ci-image", "promote", "ZOE_APPLE_ID"))
         self.assertEqual(zoe.paths["hostSetup"], "/Users/zoe/code/agent-host-setup")
         pro = controller.pin_for_host(manifest, "christophers-macbook-pro")
-        self.assertEqual((pro.role, pro.phase, pro.version, pro.build), ("phone-gate", "stage", "27.2", "27B52"))
+        self.assertEqual((pro.role, pro.phase, pro.version, pro.build), ("phone-gate", "promote", "27.2", "27B52"))
         self.assertEqual(pro.runner, {"label": "actions.runner.darwin-health.evo-cd-mbp-device",
                                       "dir": "/Users/chrisheinrich/actions-runner-evo-cd-mbp-device",
                                       "requiredEnv": ["MORPHEUS_CREDENTIALS_REPO"], "organization": "darwin-health"})
         self.assertEqual(pro.checks[0]["argv"][-2:], ["--device-gate", UDID])
-        air = controller.pin_for_host(manifest, "christophers-macbook-air")
-        self.assertEqual((air.apple, air.runner, air.verification, air.phase),
-                         ({"idVar": "APPLE_ID", "passwordVar": "APPLE_ID_PASSWORD"}, None, None, "stage"))
-        self.assertEqual(air.device_udid, "00008150-0015741E3AEA401C")
+        # The MacBook Air left the pool on 2026-10-31; it is not a Factory host.
+        self.assertNotIn("christophers-macbook-air", json.loads(manifest.read_text())["hosts"])
 
     def test_xcodes_names_the_configured_variables_when_missing(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -499,6 +657,7 @@ class FakeHost:
             device_record(UDID.lower(), "connected", "wired"),
             device_record("00008150-0015741E3AEA401C", "disconnected", "localNetwork", name="Other iPhone")]}}
         self.gh = (0, "")
+        self.provider = 75  # the provider probe's exit: 75 no code yet, 78 refused
         self.env = {"ZOE_APPLE_ID": "user@example.test", "ZOE_APPLE_ID_PASSWORD": "secret",
                     "FACTORY_VERIFICATION_CODE_COMMAND": sys.executable,
                     "FACTORY_VERIFICATION_CODE_URL": "https://broker.example.test", "USER": "chris"}
@@ -531,6 +690,8 @@ class FakeHost:
 
     def gh_run(self, argv, **kwargs):
         self.commands.append(argv)
+        if argv == [sys.executable]:  # the verification-code provider probe
+            return SimpleNamespace(returncode=self.provider, stdout="", stderr="verification code unavailable")
         code, stderr = self.gh
         return SimpleNamespace(returncode=code, stdout="secret-body", stderr=stderr)
 
@@ -624,6 +785,20 @@ class CheckTests(unittest.TestCase):
         self.assertEqual(self.failing(host), ["apple-credentials"])
         self.assertEqual(checks["apple-credentials"]["detail"], "missing or empty: ZOE_APPLE_ID_PASSWORD")
         self.assertNotIn("user@example.test", json.dumps(checks))
+
+    def test_provider_probe_distinguishes_refusal_from_no_code(self):
+        host = FakeHost(self)
+        host.provider = 75
+        self.assertTrue(host.checks()["verification-provider"]["ok"])
+        host.provider = 0
+        self.assertTrue(host.checks()["verification-provider"]["ok"])
+        host.provider = 78
+        self.assertEqual(self.failing(host), ["verification-provider"])
+        self.assertIn("enrol it with the SMS broker", host.checks()["verification-provider"]["detail"])
+        host.provider = 1
+        self.assertIn("probe exited 1", host.checks()["verification-provider"]["detail"])
+        probe = [argv for argv in host.commands if argv == [sys.executable]]
+        self.assertTrue(probe)
 
     def test_provider_requires_https(self):
         host = FakeHost(self)
@@ -877,7 +1052,8 @@ class PruneTests(unittest.TestCase):
         def identity(app):
             if app.name in unreadable or not app.name.startswith("Xcode"):
                 return None
-            return ("x", "y")
+            # A hand-installed Xcode.app has no version in its name; Xcode's own answer sorts it.
+            return ("26.6", "17F113") if app.name == "Xcode.app" else ("x", "y")
 
         def command(argv, **kwargs):
             commands.append(argv)
@@ -892,7 +1068,11 @@ class PruneTests(unittest.TestCase):
             removed = controller.prune("27.2", "27B52", retain, before, window=window)
         helper = [argv for argv in commands if argv[0] != "/bin/ps"]
         names = [Path(path).name for path in removed]
-        self.assertEqual(helper, [["/usr/bin/sudo", "-n", controller.HELPER_PATH, "remove", path] for path in removed])
+        # Factory's bundles go through the root helper; a hand-installed Xcode.app is removed directly.
+        self.assertEqual(helper, [["/usr/bin/sudo", "-n", controller.HELPER_PATH, "remove", path] for path in removed if Path(path).name != "Xcode.app"])
+        for path in removed:
+            if Path(path).name == "Xcode.app":
+                self.assertFalse(Path(path).exists())
         return names
 
     def test_retain_two_with_exactly_two_removes_nothing(self):
@@ -904,9 +1084,71 @@ class PruneTests(unittest.TestCase):
     def test_versions_compare_numerically(self):
         self.assertEqual(self.prune(["27.2", "26.9", "26.10"], 2), ["Xcode_26.9.app"])
 
-    def test_retain_one_keeps_only_selected_and_never_plain_xcode(self):
+    def test_retain_one_removes_a_hand_installed_xcode_too_but_never_an_unidentified_bundle(self):
+        # One Xcode per host (Chris, 2026-10-31) covers the app the host had before Factory.
         self.assertEqual(sorted(self.prune(["27.2", "27.0", "26.3"], 1, extra=["Xcode.app", "Xcode_beta.app"])),
-                         ["Xcode_26.3.app", "Xcode_27.0.app"])
+                         ["Xcode.app", "Xcode_26.3.app", "Xcode_27.0.app"])
+        self.assertEqual(self.prune(["27.2"], 1, extra=["Xcode.app"], unreadable=["Xcode.app"]), [])
+
+    def test_hand_installed_xcode_sorts_by_its_own_version(self):
+        # 26.6 (what Xcode.app reports) is older than 27.0, so it goes first at retain 2.
+        self.assertEqual(self.prune(["27.2", "27.0"], 2, extra=["Xcode.app"]), ["Xcode.app"])
+
+    def test_hand_installed_xcode_survives_the_migration_window(self):
+        self.assertEqual(self.prune(["27.2"], 1, extra=["Xcode.app"], window=True), [])
+
+    def test_hand_installed_xcode_the_caller_cannot_delete_is_left_alone(self):
+        # A root-owned Xcode.app (an App Store install) is not a candidate: the
+        # other surplus still goes, and no reconcile fails over it.
+        with patch.object(controller, "removable_by_caller", return_value=False):
+            self.assertEqual(self.prune(["27.2", "27.0"], 1, extra=["Xcode.app"]), ["Xcode_27.0.app"])
+
+    def test_hand_installed_xcode_with_a_non_numeric_version_is_left_alone(self):
+        def identity(app):
+            return ("26.0 beta", "23A5001") if app.name == "Xcode.app" else ("x", "y")
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        applications = Path(temporary.name).resolve()
+        for name in ("Xcode_27.2.app", "Xcode.app"):
+            (applications / name).mkdir()
+        current = {"selectedMatches": True, "selected": str(applications / "Xcode_27.2.app/Contents/Developer")}
+        with patch.object(controller, "APPLICATIONS", applications), patch.object(controller, "installed_build", side_effect=identity), \
+             patch.object(controller, "report", return_value=current), patch.object(controller, "host_is_busy", return_value=False), \
+             patch.object(controller, "root_helper") as helper:
+            self.assertEqual(controller.prune("27.2", "27B52", 1), [])
+        helper.assert_not_called()
+        self.assertTrue((applications / "Xcode.app").exists())
+
+    def test_hand_installed_xcode_is_set_aside_before_deletion_so_a_failure_stays_visible(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        applications = Path(temporary.name).resolve()
+        app = applications / "Xcode.app"
+        app.mkdir()
+        with patch.object(controller.shutil, "rmtree", side_effect=OSError(1, "Operation not permitted")):
+            with self.assertRaisesRegex(controller.UpdateError, "could not remove .*Xcode.app \\(see .*Xcode.app.removing\\)"):
+                controller.remove_app(app)
+        self.assertFalse(app.exists())
+        self.assertTrue((applications / "Xcode.app.removing").is_dir())
+        # The leftover blocks a second attempt rather than being silently deleted beside it.
+        app.mkdir()
+        with self.assertRaisesRegex(controller.UpdateError, "left from an earlier removal"):
+            controller.remove_app(app)
+
+    def test_selected_hand_installed_xcode_is_protected(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        applications = Path(temporary.name).resolve()
+        (applications / "Xcode.app").mkdir()
+        (applications / "Xcode_26.3.app").mkdir()
+        current = {"selectedMatches": True, "selected": str(applications / "Xcode.app/Contents/Developer")}
+        with patch.object(controller, "APPLICATIONS", applications), patch.object(controller, "installed_build", return_value=("27.2", "27B52")), \
+             patch.object(controller, "report", return_value=current), patch.object(controller, "host_is_busy", return_value=False), \
+             patch.object(controller, "root_helper") as helper:
+            removed = controller.prune("27.2", "27B52", 1)
+        self.assertEqual([Path(p).name for p in removed], ["Xcode_26.3.app"])
+        self.assertTrue((applications / "Xcode.app").exists())
+        helper.assert_called_once_with("remove", applications / "Xcode_26.3.app")
 
     def test_previously_selected_app_is_kept_over_a_newer_leftover(self):
         self.assertEqual(self.prune(["27.2", "27.0", "26.3"], 2, previous="26.3"), ["Xcode_27.0.app"])

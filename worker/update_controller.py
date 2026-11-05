@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -367,28 +368,63 @@ def xcodes_environment(apple=None):
 
 
 def request_verification_code(verification, started_at, timeout_seconds, length):
-    """Ask a host-installed provider for one code without logging its output."""
+    """Ask a host-installed provider for one code without logging its output.
+
+    One SMS per wait window: the provider is asked again every few seconds until
+    the window that began at started_at has elapsed, so a provider that answers
+    "no code" at once (the Pro, 2026-10-31: an unauthorized caller) cannot make
+    the caller request a new code early. Exit 75 is "no code yet"; exit 78 is a
+    refusal (bad token or configuration) and stops the run without a resend.
+    """
     executable = os.environ.get("FACTORY_VERIFICATION_CODE_COMMAND", "")
     if not executable or not Path(executable).is_absolute() or not os.access(executable, os.X_OK):
         raise UpdateError("verification-code provider is not configured as an executable absolute path")
     env = {key: os.environ[key] for key in ("HOME", "PATH", "TMPDIR", "LANG", "USER", "LOGNAME", "FACTORY_VERIFICATION_CODE_URL", "FACTORY_VERIFICATION_CODE_TOKEN") if key in os.environ}
-    request = {"purpose": verification["purpose"], "account": verification["account"], "challengeStartedAt": started_at, "timeoutSeconds": timeout_seconds}
-    try:
-        result = subprocess.run([executable], input=json.dumps(request), text=True, capture_output=True, env=env, check=False, timeout=timeout_seconds + 10)
-    except subprocess.TimeoutExpired as error:
-        raise CodeTimeout("verification-code provider timed out") from error
-    if result.returncode == 75:
-        raise CodeTimeout("verification code did not arrive")
-    if result.returncode:
-        raise UpdateError("verification-code provider failed")
-    try:
-        response = json.loads(result.stdout)
-        code = response["code"]
-    except (ValueError, KeyError, TypeError) as error:
-        raise UpdateError("verification-code provider returned an invalid response") from error
-    if not isinstance(code, str) or not CODE.fullmatch(code) or len(code) != length:
-        raise UpdateError("verification-code provider returned an invalid code length")
-    return code
+    deadline = (started_at or time.time()) + timeout_seconds
+    while True:
+        remaining = max(1, int(deadline - time.time()))
+        request = {"purpose": verification["purpose"], "account": verification["account"], "challengeStartedAt": started_at, "timeoutSeconds": remaining}
+        try:
+            result = subprocess.run([executable], input=json.dumps(request), text=True, capture_output=True, env=env, check=False, timeout=remaining + 10)
+        except subprocess.TimeoutExpired as error:
+            raise CodeTimeout("verification-code provider timed out") from error
+        if result.returncode == 78:
+            raise UpdateError("verification-code provider refused this host (enrol it with the broker)")
+        if result.returncode == 75:
+            if time.time() >= deadline:
+                raise CodeTimeout("verification code did not arrive")
+            time.sleep(min(10, max(1, deadline - time.time())))
+            continue
+        if result.returncode:
+            raise UpdateError("verification-code provider failed")
+        try:
+            response = json.loads(result.stdout)
+            code = response["code"]
+        except (ValueError, KeyError, TypeError) as error:
+            raise UpdateError("verification-code provider returned an invalid response") from error
+        if not isinstance(code, str) or not CODE.fullmatch(code) or len(code) != length:
+            raise UpdateError("verification-code provider returned an invalid code length")
+        return code
+
+
+def _answer_hidden_prompt(master, line, timeout=5.0):
+    """Write a reply to a prompt xcodes reads with readpassphrase(3).
+
+    readpassphrase first resets the terminal with TCSAFLUSH, which discards any
+    input already queued. Writing the reply the instant the prompt text arrives
+    therefore loses it and both sides wait forever (the Pro, 2026-10-31). The
+    terminal reports echo off once readpassphrase is reading, so wait for that
+    before writing; the master shares the slave's termios on macOS.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if not termios.tcgetattr(master)[3] & termios.ECHO:
+                break
+        except termios.error:
+            break
+        time.sleep(0.05)
+    os.write(master, line)
 
 
 def _xcodes_interactive_attempt(argv, verification, wait_seconds, first_challenge, apple=None):
@@ -418,7 +454,7 @@ def _xcodes_interactive_attempt(argv, verification, wait_seconds, first_challeng
                     output = (output + chunk.decode("utf-8", errors="replace"))[-131072:]
                     recent = output[-8192:]
                     if not sms_selected and 'Enter "sms"' in recent and "trusted devices:" in recent:
-                        os.write(master, b"sms\n")
+                        _answer_hidden_prompt(master, b"sms\n")
                         sms_selected = True
                     if not phone_selected and "Select a trusted phone number to receive a code via SMS:" in recent:
                         choices = re.findall(r"(?m)^([0-9]+): .+$", recent)
@@ -441,7 +477,7 @@ def _xcodes_interactive_attempt(argv, verification, wait_seconds, first_challeng
                             code = request_verification_code(verification, challenge_started, wait_seconds, int(match.group(1)))
                         except CodeTimeout as error:
                             raise CodeTimeout(str(error), challenge_started) from error
-                        os.write(master, f"{code}\n".encode())
+                        _answer_hidden_prompt(master, f"{code}\n".encode())
                         code_submitted = True
                     continue
             if process.poll() is not None:
@@ -506,19 +542,46 @@ def interactive_login(apple=None):
     return "apple-authenticated"
 
 
+IDLE_WAIT_SECONDS = 2 * 60 * 60
+IDLE_POLL_SECONDS = 30
+# A component install leaves xcodebuild helpers alive for a moment after it
+# returns; a real job holds Runner.Worker far longer than this settle window.
+SETTLE_SECONDS = 60
+SETTLE_POLL_SECONDS = 2
+
+
+def wait_until_idle(timeout=IDLE_WAIT_SECONDS, poll=IDLE_POLL_SECONDS):
+    """Return True once no runner job or build is live, or False after timeout."""
+    deadline = time.monotonic() + timeout
+    while host_is_busy():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll)
+    return True
+
+
 def ensure_components(app, components):
+    # Component installs (cryptexes) rewrite shared frameworks under any
+    # running xcodebuild, like first launch does; never while CI is busy.
+    if components and host_is_busy():
+        return False
     child = {key: os.environ[key] for key in ("HOME", "PATH", "TMPDIR", "LANG", "USER", "LOGNAME") if key in os.environ}
     child["DEVELOPER_DIR"] = str(app / "Contents/Developer")
     for component in components:
         run([str(app / "Contents/Developer/usr/bin/xcodebuild"), "-downloadComponent", component], env=child, capture=False, timeout=7200)
+    return True
 
 
 def stage(version, build, stage_root, verification=None, components=(), apple=None):
     app = app_path(version)
     existing = matching_app(version, build)
     if existing is not None:
-        ensure_components(existing, components)
-        return "already-installed"
+        return "already-installed" if ensure_components(existing, components) else "deferred-busy"
+    # Staging's first launch rewrites shared system frameworks; on the Pro
+    # (2026-10-31) it killed a running CD phone gate. Do not even start while
+    # a runner job or build is live, and check again before first launch.
+    if host_is_busy():
+        return "deferred-busy"
     have = installed_build(app)
     if have is not None or app.exists():
         raise UpdateError(f"{app} exists with the wrong build; refusing overwrite")
@@ -545,11 +608,20 @@ def stage(version, build, stage_root, verification=None, components=(), apple=No
         # The helper moves the bundle into a root-only quarantine, verifies its
         # signature there, runs first launch, and only then installs it, so
         # nothing the worker user can still write ever runs as root.
+        if not wait_until_idle():
+            raise UpdateError("host stayed busy for two hours after the download; staging deferred (download discarded)")
         root_helper("install", expanded, version, capture=False)
+    require_readable(app)
     if installed_build(app) != (version, build):
         raise UpdateError("installed Xcode did not retain the approved identity")
     ensure_components(app, components)
     return "staged"
+
+
+def require_readable(app):
+    """An installed bundle the login user cannot execute is a helper defect, not an identity mismatch."""
+    if not os.access(app / "Contents/Developer/usr/bin/xcodebuild", os.X_OK):
+        raise UpdateError(f"{app} is not readable by this user after install; the root helper must leave it world-readable")
 
 
 def root_helper(verb, *arguments, capture=True):
@@ -661,8 +733,9 @@ def reconcile(version, build, checks, phase, stage_root, verification=None, comp
     if before["selectedMatches"]:
         return "already-current"
     # Do not run a long validation build beside a live job only for activation
-    # to refuse afterwards; the next tick retries.
-    if host_is_busy():
+    # to refuse afterwards; the next tick retries. Helpers of the component
+    # step above may still be exiting, so settle briefly before deciding.
+    if not wait_until_idle(timeout=SETTLE_SECONDS, poll=SETTLE_POLL_SECONDS):
         return "deferred-busy"
     validate(version, build, checks)
     previous = before["selected"]
@@ -683,6 +756,31 @@ def version_key(version):
     return tuple(int(part) for part in version.split("."))
 
 
+def removable_by_caller(app):
+    """A hand-installed bundle the caller can delete without root: the caller
+    owns it and can unlink it from /Applications."""
+    return app.lstat().st_uid == os.getuid() and os.access(app.parent, os.W_OK)
+
+
+def remove_app(app):
+    """Remove one Xcode bundle: Factory installs through the root helper, a
+    hand-installed /Applications/Xcode.app directly, since the caller owns it."""
+    if app.name != "Xcode.app":
+        root_helper("remove", app)
+        return
+    # Set it aside first: a delete that fails part-way (App Management, a
+    # root-owned file inside) then leaves a visibly half-removed bundle, not an
+    # Xcode.app whose xcodebuild is gone and which no later prune would see.
+    aside = app.with_name("Xcode.app.removing")
+    if aside.exists():
+        raise UpdateError(f"{aside} is left from an earlier removal; remove it by hand")
+    try:
+        app.rename(aside)
+        shutil.rmtree(aside)
+    except OSError as error:
+        raise UpdateError(f"could not remove {app} (see {aside}): {error.strerror}") from error
+
+
 def prune(version, build, retain, previous=None, window=False):
     """Keep `retain` Xcode bundles: protected ones first, then the newest others.
 
@@ -691,6 +789,9 @@ def prune(version, build, retain, previous=None, window=False):
     /Applications/Xcode.app symlink. During the migration window (`window`:
     promoted but not yet validated) at least two bundles stay, so the previous
     Xcode survives until delivery is green whatever `retain` says.
+    A hand-installed /Applications/Xcode.app (a real directory, not a symlink)
+    is a bundle like any other once Xcode identifies it: one Xcode per host
+    (Chris, 2026-10-31) applies to the app the host had before Factory too.
     Returns the removed paths, or None when the host is busy and nothing was
     considered, so a caller can tell "nothing to remove" from "not now".
     """
@@ -721,10 +822,21 @@ def prune(version, build, retain, previous=None, window=False):
         # Only a bundle Xcode itself identifies is ours to remove.
         if identity is not None:
             candidates.append((version_key(match.group(1)), app))
+    # The root helper removes only Factory's versioned bundles, so a plain
+    # Xcode.app is a candidate only when the caller can delete it: one owned
+    # by root (an App Store install) stays, for removal by hand, rather than
+    # failing every later reconcile.
+    if plain.is_dir() and not plain.is_symlink() and plain.resolve() not in protected and removable_by_caller(plain):
+        try:
+            identity = installed_build(plain)
+        except UpdateError:
+            identity = None
+        if identity is not None and re.fullmatch(r"[0-9]+(\.[0-9]+)*", identity[0]):
+            candidates.append((version_key(identity[0]), plain))
     candidates.sort(reverse=True)
     removed = []
     for _, app in candidates[max(0, retain - len(protected)):]:
-        root_helper("remove", app)
+        remove_app(app)
         removed.append(str(app))
     return removed
 
@@ -855,7 +967,22 @@ def check_provider(pin):
         problems.append("FACTORY_VERIFICATION_CODE_COMMAND is not an executable absolute path")
     if not url.startswith("https://"):
         problems.append("FACTORY_VERIFICATION_CODE_URL is not https")
-    return (False, "; ".join(problems)) if problems else (True, "verification-code provider configured")
+    if problems:
+        return False, "; ".join(problems)
+    # A one-second dry request proves the broker accepts this host's token
+    # before any Apple login spends an SMS: 75 (no code yet) and 0 are fine,
+    # 78 is a refusal (the host is not enrolled), anything else is a failure.
+    env = {key: os.environ[key] for key in ("HOME", "PATH", "TMPDIR", "LANG", "USER", "LOGNAME", "FACTORY_VERIFICATION_CODE_URL", "FACTORY_VERIFICATION_CODE_TOKEN") if key in os.environ}
+    request = {"purpose": pin.verification["purpose"], "account": pin.verification["account"], "challengeStartedAt": int(time.time()) - 60, "timeoutSeconds": 1}
+    try:
+        probe = subprocess.run([command], input=json.dumps(request), text=True, capture_output=True, env=env, check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return False, "verification-code provider did not answer a one-second probe"
+    if probe.returncode in (0, 75):
+        return True, "verification-code provider configured and the broker accepts this host"
+    if probe.returncode == 78:
+        return False, "verification-code provider refused this host; enrol it with the SMS broker (zoe/sms/enroll-host.py)"
+    return False, f"verification-code provider probe exited {probe.returncode}"
 
 
 def check_paths(pin):
