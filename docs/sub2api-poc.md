@@ -158,3 +158,35 @@ The PR originally added three scripts. Review findings and what was done:
 - Original PoC smoke checks (2026-10-31): `GET /health` 200 over localhost,
   tailnet IP and MagicDNS; Anthropic `POST /v1/messages` and OpenAI
   `GET /v1/models` / `POST /v1/responses` returned real completions.
+- Author validation at `e6bfd01`: `pnpm typecheck` passed, `pnpm test` 68/68,
+  `pnpm build` passed, Python `unittest discover` 235/235 (5 new).
+
+## Appendix C — Independent review and live pin check, 2026-11-04
+
+- **Independent review cleared** `e6bfd01b442920110a56fba47eb03c5cf9a621ed`
+  (base `16ad579c9100ae486cc77821a12c878d5fc63565`) with no blocking findings.
+  The reviewer was a fresh Factory run, `e8cea9d3-9617-4032-aedf-f2c8d45da6be`
+  (Claude session `009caaa0-b888-4955-86b6-b377141a550e`). It reran the 5 setup
+  tests, `shellcheck` and `bash -n`. It also checked the compose checksum and
+  confirmed that `0.2.19` and `latest` have the same Docker Hub digest.
+- **Root re-check:** the 5 unittest tests, `bash -n` and `git diff --check`
+  passed. The live gateway health check returned `ok`.
+- **Live pins match (read-only check over SSH; no secrets read):**
+  - The deployed `docker-compose.local.yml` has SHA-256
+    `d8dfd3798fb9e4aea102bbb681d092529aa169337a5fbf003a038a14640c8de1`, the
+    same as the committed pin.
+  - The running `weishaw/sub2api:latest` is
+    `sha256:969e5c0fddc13f52be2772ea86e8e03ee2261f80ff08495916ffff68292c8380`
+    (OCI version `0.2.19`, revision `dece26153621959ccd7635814f4b2d08304e681a`).
+    This is the same registry digest the reviewer found for `0.2.19`.
+  - Re-applying the script should therefore leave the running image and
+    compose file unchanged. It was still not re-run live.
+- **Limitation:** the repository has no GitHub CI workflow, and `main` has no
+  branch protection. The evidence above is local and reviewer validation only;
+  no CI check backs this PR.
+- **Non-blocking notes for the onboarding work (not done here):**
+  - Optionally pin the app image by digest.
+  - The postgres and redis tags still float within their major versions.
+  - The `0.0.0.0` bind also exposes the gateway to the LAN (documented above).
+  - Validate operator-supplied `TZ` and `ADMIN_EMAIL` against embedded newlines.
+  - Confirm that the mode-700 data directories work on a fresh Colima install.
