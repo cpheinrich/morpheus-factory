@@ -2,13 +2,13 @@
 
 Placement and subscription control plane for a Morpheus worker fleet.
 
-Paperclip decides **what** runs. Factory decides **where** and **on whose
+The controller decides **what** runs. Factory decides **where** and **on whose
 capacity** — which machine, which workspace, which subscription group, and
 whether that group can take another turn right now. It emits one immutable run
 spec, and the existing runner executes it.
 
-This repository is the factory only. Paperclip integration, the pool runner,
-quota reads and closeout export stay in `cpheinrich/morpheus`.
+This repository is the factory only. The runner, quota reads and closeout export
+stay in `cpheinrich/morpheus`.
 
 ## Why this is separate
 
@@ -54,11 +54,9 @@ pnpm factory plan --task MO-26-10-28-00.00.00 --profile claude-max --config exam
 }
 ```
 
-Deliberately **not** here yet: SSH execution, provider process management,
-streaming, session resume, Paperclip API calls. The factory contract keeps that
-execution work in Morpheus. As of 2026-10-29, Morpheus main does not contain
-the `pool-runner.mjs` and `pool-remote.mjs` entry points described by the
-original design, so fleet activation remains a separate integration step.
+SSH execution, provider process management, streaming and session resume stay in
+Morpheus. Morpheus carries a source copy of this package under
+`plugins/factory/src/host/`; changing this repository does not update that copy.
 
 ## The two decisions in code
 
@@ -71,21 +69,25 @@ methods: `snapshot()` and `auth()`. `CapacityBroker` reads one stable JSON
 document; `NativeBroker` is the degraded path. Adding a gateway means adding one
 file.
 
-## Paperclip integration
+## Controller and runner boundary
 
-Factory does **not** introduce a new Paperclip adapter type.
+The controller supplies a task identifier and profile. Factory resolves host,
+workspace and capacity into a run spec, or returns a refusal. The runner owns
+provider execution, streaming and session resume; callers retain per-profile
+model and permission information from the spec.
 
-Paperclip's adapters answer "how is one turn executed". Factory answers "where,
-on whose capacity". They are orthogonal, and collapsing them would either lose
-per-provider execution or lose placement.
+See [`docs/design.md`](docs/design.md) for the contract and placement rules.
 
-Instead: keep the `process` adapter — already qualified in Morpheus — and
-register **one agent per profile**, each running the factory entry point. The
-board then shows `claude-max`, `codex-pro`, `grok-fast` as distinct workers with
-their real model and permission, instead of one opaque `morpheus-factory` actor.
-One binary, many registrations, no forked adapter contract.
+## Consumption and review
 
-Full reasoning: [`docs/design.md`](docs/design.md).
+This private package is built locally with `pnpm build`; it has no package
+publication or service deployment workflow in this repository. Morpheus's host
+package is a source import, not a live dependency on this checkout, and must be
+updated and reviewed separately. Standalone worker setup builds this checkout;
+the hourly host updater fast-forwards a clean `main` checkout before reconciling
+the reviewed Xcode manifest. Keep changes behind independent review and the
+checks below before merge. Do not run host reconciliation to validate a source
+or documentation change.
 
 ## Commands
 
@@ -93,6 +95,8 @@ Full reasoning: [`docs/design.md`](docs/design.md).
 pnpm install
 pnpm typecheck
 pnpm test
+pnpm build
+python3 -m unittest discover -s tests -p 'test_*.py'
 pnpm factory profiles --config examples/factory.example.json
 pnpm factory plan --task t1 --profile codex-pro --host mini --config examples/factory.example.json
 ```

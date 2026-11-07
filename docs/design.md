@@ -1,7 +1,8 @@
 # Design
 
-Status: v0, 2026-10-28. This records the decisions behind the first version so a
-later reader can tell judgement from accident.
+Status: v0, 2026-10-28; controller boundary updated 2026-11-07. The placement
+and capacity contract below is current. Dated host rollout records retain their
+historical evidence and explicitly recorded superseding decisions.
 
 ## The problem
 
@@ -21,7 +22,7 @@ awkward, and it makes a new machine a re-authentication chore.
 Factory splits the decision in two:
 
 ```
-Paperclip            what runs, and when
+controller           what runs, and when
    │
 factory              where, and on whose capacity      ← this repo
    │   run spec
@@ -30,30 +31,21 @@ runner               executes one turn
 broker               request → subscription account
 ```
 
-Paperclip keeps scheduling. The broker keeps credentials and account selection.
+The controller keeps scheduling. The broker keeps credentials and account selection.
 Factory is the seam between them, and owns the only durable artifact: the run
 spec.
 
-## Why not a custom Paperclip adapter
+## Execution boundary
 
-Paperclip's adapter answers *how one turn is executed* — which CLI, how it is
-spawned, how its stream is folded, how a session resumes. Factory answers *where
-and on whose capacity*. Those are orthogonal.
+Factory answers *where and on whose capacity*. The controller owns scheduling,
+and the runner owns CLI invocation, streaming and session resume. Factory emits
+one immutable run spec with the selected profile, provider, model, permission,
+host, workspace and credential reference. No scheduler-specific registration or
+adapter type is required by this package.
 
-A single `morpheus-factory` adapter would force one of two bad outcomes:
-
-- reimplement every provider's CLI driver inside the adapter, duplicating the one
-  part Paperclip already does well and that breaks whenever a CLI ships; or
-- hide provider identity from the board, so every run looks the same and nobody
-  can see which model or permission actually ran.
-
-So the factory registers **one agent per profile** under the existing `process`
-adapter, which is already qualified in Morpheus. One binary, many registrations,
-no forked adapter contract, and the board keeps per-profile observability.
-
-If Paperclip later needs factory to own the inbound answer channel — the current
-co-location constraint on the process adapter — that becomes a second entry point
-over the same core, not a rewrite of the selection logic.
+Morpheus carries the host tooling as a source import under
+`plugins/factory/src/host/`. A standalone Factory change must be reconciled with
+that copy separately; the source repository is not its live runtime dependency.
 
 ## Placement
 
@@ -174,8 +166,8 @@ an outage — otherwise the gate quietly disappears whenever a broker misbehaves
 
 1. Do Claude Code, Codex and Grok CLIs complete a real coding session through a
    gateway — tools, streaming, websockets, session affinity?
-2. Does the native runner dissolve the process adapter's controller/coordinator
-   co-location constraint, and therefore permit deeper agent hierarchies?
+2. Which controller/runner transport supports remote coordination and deeper
+   agent hierarchies without coupling placement to execution?
 3. Which per-account usage can be read reliably enough to feed the capacity
    document, at what latency?
 4. Does a broker upgrade preserve the credential chain, and how is that tested
