@@ -79,7 +79,7 @@ export class CapacityBroker implements BrokerPort {
 
   /**
    * Emits a reference, never a value. The runner resolves it at spawn time so
-   * the key cannot end up in a plan, a log line or a Paperclip comment.
+   * the key cannot end up in a plan, a log line or a task comment.
    */
   auth(profile: Profile): Auth {
     return {

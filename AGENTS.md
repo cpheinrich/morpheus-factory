@@ -5,12 +5,12 @@ file holds the rules.
 
 ## What this repo is
 
-Placement and subscription control plane for a Morpheus worker fleet. Paperclip
-decides what runs; factory decides where and on whose capacity, and emits one
-immutable run spec.
+Placement and subscription control plane for a Morpheus worker fleet. The
+controller supplies work; Factory decides where and on whose capacity, and emits
+one immutable run spec.
 
-It is **not** the runner. Execution, streaming, session resume, quota reads and
-Paperclip API calls live in `cpheinrich/morpheus`. Do not reimplement them here.
+It is **not** the runner. Execution, streaming, session resume and quota reads
+live in `cpheinrich/morpheus`. Do not reimplement them here.
 
 ## Layout
 
@@ -55,11 +55,12 @@ pnpm build
   `inFlight === maxConcurrency` both refuse. Keep those tests when editing.
 - **Placement stays pure.** No I/O in `place.ts`; the same inputs must always
   produce the same host.
-- **Do not add a Paperclip adapter type.** Factory registers under the existing
-  `process` adapter, one agent per profile. See `docs/design.md`.
+- **Keep scheduling and execution outside Factory.** Accept a request and emit
+  a run spec; the controller and runner own the task lifecycle.
 
 ## Consuming from Morpheus
 
-Morpheus depends on this package; this package depends on nothing from Morpheus.
-That direction is deliberate — it keeps the credential surface out of the
-scaffolding repo.
+Morpheus carries a source import at `plugins/factory/src/host/`, rather than a
+live package dependency on this checkout. Reconcile changes there separately.
+This package depends on nothing from Morpheus; keep that direction so the
+credential surface stays out of the scaffolding repo.
